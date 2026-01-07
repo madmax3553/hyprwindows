@@ -1,0 +1,67 @@
+[
+  {
+    "dotfile": "qutebrowser",
+    "classes": ["qutebrowser", "org.qutebrowser.qutebrowser"],
+    "group": "browser"
+  },
+  {
+    "dotfile": "mpv",
+    "classes": ["mpv"],
+    "group": "multimedia_video"
+  },
+  {
+    "dotfile": "rofi",
+    "classes": ["rofi", "Rofi"],
+    "group": "settings"
+  },
+  {
+    "dotfile": "ghostty",
+    "classes": ["ghostty", "com.mitchellh.ghostty"],
+    "group": "terminal"
+  },
+  {
+    "dotfile": "kitty",
+    "classes": ["kitty"],
+    "group": "terminal"
+  },
+  {
+    "dotfile": "swaync",
+    "classes": ["swaync-control-center", "swaync-notification-window", "swaync-client"],
+    "group": "notif"
+  },
+  {
+    "dotfile": "waypaper",
+    "classes": ["waypaper"],
+    "group": "wallpaper"
+  },
+  {
+    "dotfile": "waybar",
+    "classes": ["waybar"],
+    "group": "settings"
+  },
+  {
+    "dotfile": "wlogout",
+    "classes": ["wlogout"],
+    "group": "settings"
+  },
+  {
+    "dotfile": "pavucontrol.ini",
+    "classes": ["pavucontrol", "org.pulseaudio.pavucontrol", "com.saivert.pwvucontrol"],
+    "group": "settings"
+  },
+  {
+    "dotfile": "qalculate",
+    "classes": ["qalculate-gtk", "Qalculate-gtk"],
+    "group": "settings"
+  },
+  {
+    "dotfile": "qt5ct",
+    "classes": ["qt5ct"],
+    "group": "settings"
+  },
+  {
+    "dotfile": "qt6ct",
+    "classes": ["qt6ct"],
+    "group": "settings"
+  }
+]
