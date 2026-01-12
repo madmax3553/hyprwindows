@@ -1,677 +1,1247 @@
 #include "ui.h"
 
 #include <ctype.h>
+#include <locale.h>
 #include <ncurses.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "actions.h"
+#include "hyprctl.h"
+#include "rules.h"
 
-#define UI_MIN_WIDTH 70
-#define UI_MIN_HEIGHT 20
+#define UI_MIN_WIDTH 80
+#define UI_MIN_HEIGHT 24
+
+/* views */
+enum view_mode {
+    VIEW_RULES,
+    VIEW_WINDOWS,
+    VIEW_REVIEW,
+    VIEW_SETTINGS,
+};
+
+/* rule status flags */
+enum rule_status {
+    RULE_OK = 0,
+    RULE_UNUSED = 1,      /* no matching window */
+    RULE_DUPLICATE = 2,   /* same pattern as another rule */
+};
 
 struct ui_state {
+    enum view_mode mode;
     int selected;
     int scroll;
-    int content_lines;
-    char *content;
 
+    /* loaded data */
+    struct ruleset rules;
+    enum rule_status *rule_status;  /* status for each rule */
     char rules_path[512];
     char dotfiles_path[512];
     char appmap_path[512];
 
+    /* cached review data */
+    struct missing_rules missing;
+    char *review_text;
+    int review_loaded;
+
+    /* dirty tracking */
+    int modified;           /* rules have been modified */
+    int backup_created;     /* backup file was created this session */
+    char backup_path[512];  /* path to backup file */
+
+    /* options */
     int suggest_rules;
     int show_overlaps;
+
+    /* status message */
+    char status[256];
 };
 
-struct rule_editor {
-    char name[128];
-    char match_class[256];
-    char match_title[256];
-    char tag[64];
-    char workspace[32];
-    char opacity[32];
-    char size[32];
-    char move[32];
-    int set_float;
-    int set_center;
+/* colors */
+enum {
+    COL_TITLE = 1,
+    COL_BORDER,
+    COL_STATUS,
+    COL_SELECT,
+    COL_NORMAL,
+    COL_DIM,
+    COL_ACCENT,
+    COL_WARN,
+    COL_ERROR,
 };
 
-static const char *menu_items[] = {
-    "Summarize Rules",
-    "Scan Dotfiles",
-    "Active Windows",
-    "Rule Editor",
-    "Settings",
-    "Quit",
-};
+/* forward declarations */
+static void clean_class_name(const char *regex, char *out, size_t out_sz);
+static void update_display_name(struct rule *r);
 
-static int menu_count(void) {
-    return (int)(sizeof(menu_items) / sizeof(menu_items[0]));
+static void set_status(struct ui_state *st, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(st->status, sizeof(st->status), fmt, args);
+    va_end(args);
 }
 
-static void set_default_paths(struct ui_state *st) {
-    const char *home = getenv("HOME");
-    if (!home) {
-        home = ".";
-    }
-    snprintf(st->rules_path, sizeof(st->rules_path), "%s/.config/hypr/configs/windowrules.jsonc", home);
-    snprintf(st->dotfiles_path, sizeof(st->dotfiles_path), "%s/dotfiles", home);
-    snprintf(st->appmap_path, sizeof(st->appmap_path), "data/appmap.json");
-}
-
-static char *expand_home(const char *path) {
-    if (!path) {
-        return NULL;
-    }
-    if (path[0] != '~') {
-        return strdup(path);
+static char *expand_path(const char *path) {
+    if (!path || path[0] != '~') {
+        return path ? strdup(path) : NULL;
     }
     const char *home = getenv("HOME");
-    if (!home) {
-        home = ".";
-    }
-    size_t hlen = strlen(home);
-    size_t plen = strlen(path);
-    char *out = (char *)malloc(hlen + plen);
-    if (!out) {
-        return NULL;
-    }
-    strcpy(out, home);
-    if (path[1] == '/') {
-        strcat(out, path + 1);
-    } else {
+    if (!home) home = ".";
+    size_t len = strlen(home) + strlen(path);
+    char *out = malloc(len);
+    if (out) {
+        strcpy(out, home);
         strcat(out, path + 1);
     }
     return out;
 }
 
-static void content_set(struct ui_state *st, const char *text) {
-    free(st->content);
-    st->content = NULL;
-    st->content_lines = 0;
-    st->scroll = 0;
-    if (!text) {
-        return;
-    }
-    st->content = strdup(text);
-    for (const char *p = text; *p; p++) {
-        if (*p == '\n') {
-            st->content_lines++;
-        }
-    }
-    if (st->content_lines == 0) {
-        st->content_lines = 1;
+static void init_paths(struct ui_state *st) {
+    const char *home = getenv("HOME");
+    if (!home) home = ".";
+
+    char *detected = hypr_find_rules_config();
+    if (detected) {
+        snprintf(st->rules_path, sizeof(st->rules_path), "%s", detected);
+        free(detected);
     } else {
-        st->content_lines++;
+        snprintf(st->rules_path, sizeof(st->rules_path), "%s/.config/hypr/hyprland.conf", home);
     }
+
+    snprintf(st->dotfiles_path, sizeof(st->dotfiles_path), "%s/dotfiles", home);
+    snprintf(st->appmap_path, sizeof(st->appmap_path), "data/appmap.json");
 }
 
-static int content_total_lines(const struct ui_state *st) {
-    return st->content_lines;
+static int compare_rules_by_tag(const void *a, const void *b) {
+    const struct rule *ra = (const struct rule *)a;
+    const struct rule *rb = (const struct rule *)b;
+    const char *ta = ra->actions.tag ? ra->actions.tag : "";
+    const char *tb = rb->actions.tag ? rb->actions.tag : "";
+    return strcmp(ta, tb);
 }
 
-static const char *content_line_at(const char *content, int line) {
-    if (!content || line <= 0) {
-        return content;
+/* check if two rules have the same match pattern */
+static int rules_duplicate(const struct rule *a, const struct rule *b) {
+    /* same class pattern */
+    if (a->match.class_re && b->match.class_re) {
+        if (strcmp(a->match.class_re, b->match.class_re) == 0) return 1;
     }
-    int cur = 0;
-    const char *p = content;
-    while (*p) {
-        if (*p == '\n') {
-            cur++;
-            if (cur == line) {
-                return p + 1;
+    /* same title pattern */
+    if (a->match.title_re && b->match.title_re) {
+        if (strcmp(a->match.title_re, b->match.title_re) == 0) return 1;
+    }
+    return 0;
+}
+
+static void compute_rule_status(struct ui_state *st) {
+    free(st->rule_status);
+    st->rule_status = calloc(st->rules.count, sizeof(enum rule_status));
+    if (!st->rule_status) return;
+
+    /* get active windows */
+    struct clients clients = {0};
+    int have_clients = (hyprctl_clients(&clients) == 0);
+
+    for (size_t i = 0; i < st->rules.count; i++) {
+        struct rule *r = &st->rules.rules[i];
+
+        /* check for duplicates */
+        for (size_t j = 0; j < st->rules.count; j++) {
+            if (i != j && rules_duplicate(r, &st->rules.rules[j])) {
+                st->rule_status[i] = RULE_DUPLICATE;
+                break;
             }
         }
-        p++;
+
+        /* check if unused (no matching window) */
+        if (st->rule_status[i] == RULE_OK && have_clients) {
+            int matched = 0;
+            for (size_t c = 0; c < clients.count; c++) {
+                if (rule_matches_client(r, &clients.items[c])) {
+                    matched = 1;
+                    break;
+                }
+            }
+            if (!matched) {
+                st->rule_status[i] = RULE_UNUSED;
+            }
+        }
     }
-    return NULL;
+
+    if (have_clients) clients_free(&clients);
 }
 
-static void draw_title(int width) {
-    attron(A_BOLD | COLOR_PAIR(1));
+static void load_review_data(struct ui_state *st) {
+    /* free old data */
+    missing_rules_free(&st->missing);
+    free(st->review_text);
+    st->review_text = NULL;
+    st->review_loaded = 0;
+
+    /* load review text */
+    struct outbuf out;
+    outbuf_init(&out);
+    char *path = expand_path(st->rules_path);
+    review_rules_text(path ? path : st->rules_path, &out);
+
+    /* load missing rules */
+    char *appmap_path = expand_path(st->appmap_path);
+    find_missing_rules(path ? path : st->rules_path,
+                       appmap_path ? appmap_path : st->appmap_path,
+                       st->dotfiles_path, &st->missing);
+    free(appmap_path);
+    free(path);
+
+    st->review_text = out.data;  /* take ownership */
+    out.data = NULL;
+    st->review_loaded = 1;
+}
+
+static void load_rules(struct ui_state *st) {
+    ruleset_free(&st->rules);
+    free(st->rule_status);
+    st->rule_status = NULL;
+    st->review_loaded = 0;  /* invalidate review cache */
+
+    char *path = expand_path(st->rules_path);
+    if (ruleset_load(path ? path : st->rules_path, &st->rules) == 0) {
+        /* compute display names */
+        for (size_t i = 0; i < st->rules.count; i++) {
+            update_display_name(&st->rules.rules[i]);
+        }
+        /* sort by tag for visual grouping */
+        if (st->rules.count > 1) {
+            qsort(st->rules.rules, st->rules.count, sizeof(struct rule), compare_rules_by_tag);
+        }
+        /* compute status for each rule */
+        compute_rule_status(st);
+        set_status(st, "Loaded %zu rules from %s", st->rules.count, st->rules_path);
+    } else {
+        set_status(st, "Failed to load rules from %s", st->rules_path);
+    }
+    free(path);
+}
+
+/* drawing helpers */
+static void draw_box(int y, int x, int h, int w, const char *title) {
+    attron(COLOR_PAIR(COL_BORDER));
+    mvprintw(y, x, "┌");
+    mvprintw(y, x + w - 1, "┐");
+    mvprintw(y + h - 1, x, "└");
+    mvprintw(y + h - 1, x + w - 1, "┘");
+    for (int i = 1; i < w - 1; i++) {
+        mvprintw(y, x + i, "─");
+        mvprintw(y + h - 1, x + i, "─");
+    }
+    for (int i = 1; i < h - 1; i++) {
+        mvprintw(y + i, x, "│");
+        mvprintw(y + i, x + w - 1, "│");
+    }
+    if (title) {
+        mvprintw(y, x + 2, " %s ", title);
+    }
+    attroff(COLOR_PAIR(COL_BORDER));
+}
+
+static void draw_header(int width, const char *title) {
+    attron(A_BOLD | COLOR_PAIR(COL_TITLE));
     mvhline(0, 0, ' ', width);
-    mvprintw(0, 2, "hyprwindows — window rule helper");
-    attroff(A_BOLD | COLOR_PAIR(1));
+    mvprintw(0, (width - (int)strlen(title)) / 2, "%s", title);
+    attroff(A_BOLD | COLOR_PAIR(COL_TITLE));
 }
 
-static void draw_status(int height, int width, const char *msg) {
-    attron(COLOR_PAIR(3));
-    mvhline(height - 1, 0, ' ', width);
-    if (msg) {
-        mvprintw(height - 1, 2, "%s", msg);
-    }
-    attroff(COLOR_PAIR(3));
+static void draw_statusbar(int y, int width, const char *left, const char *right) {
+    attron(COLOR_PAIR(COL_STATUS));
+    mvhline(y, 0, ' ', width);
+    if (left) mvprintw(y, 1, "%s", left);
+    if (right) mvprintw(y, width - (int)strlen(right) - 1, "%s", right);
+    attroff(COLOR_PAIR(COL_STATUS));
 }
 
-static void draw_menu(int start_y, int width, int height, int selected) {
-    attron(COLOR_PAIR(2));
-    mvhline(start_y, 0, ' ', width);
-    mvprintw(start_y, 2, "Menu");
-    attroff(COLOR_PAIR(2));
-
-    for (int i = 0; i < menu_count(); i++) {
-        int y = start_y + 2 + i;
-        if (y >= start_y + height - 1) {
-            break;
-        }
-        if (i == selected) {
-            attron(A_BOLD | COLOR_PAIR(4));
-            mvhline(y, 1, ' ', width - 2);
-            mvprintw(y, 2, "%s", menu_items[i]);
-            attroff(A_BOLD | COLOR_PAIR(4));
+static void draw_tabs(int y, int width, enum view_mode mode) {
+    (void)width;
+    const char *tabs[] = {"[1] Rules", "[2] Windows", "[3] Review", "[4] Settings"};
+    int x = 2;
+    for (int i = 0; i < 4; i++) {
+        if (i == (int)mode) {
+            attron(A_BOLD | COLOR_PAIR(COL_SELECT));
         } else {
-            mvprintw(y, 2, "%s", menu_items[i]);
+            attron(COLOR_PAIR(COL_DIM));
         }
+        mvprintw(y, x, " %s ", tabs[i]);
+        if (i == (int)mode) {
+            attroff(A_BOLD | COLOR_PAIR(COL_SELECT));
+        } else {
+            attroff(COLOR_PAIR(COL_DIM));
+        }
+        x += (int)strlen(tabs[i]) + 3;
     }
 }
 
-static void draw_content_box(int start_y, int start_x, int height, int width) {
-    attron(COLOR_PAIR(2));
-    mvhline(start_y, start_x, ' ', width);
-    mvprintw(start_y, start_x + 2, "Output");
-    attroff(COLOR_PAIR(2));
-
-    attron(COLOR_PAIR(5));
-    for (int i = 1; i < height - 1; i++) {
-        mvhline(start_y + i, start_x, ' ', width);
-    }
-    attroff(COLOR_PAIR(5));
-}
-
-static void draw_content(int start_y, int start_x, int height, int width,
-                         const struct ui_state *st) {
-    draw_content_box(start_y, start_x, height, width);
-
-    if (!st->content) {
-        attron(COLOR_PAIR(6));
-        mvprintw(start_y + 2, start_x + 2, "No output yet. Choose a menu item.");
-        attroff(COLOR_PAIR(6));
+/* helper to extract readable class name from regex */
+static void clean_class_name(const char *regex, char *out, size_t out_sz) {
+    if (!regex || !out || out_sz == 0) {
+        if (out && out_sz > 0) out[0] = '\0';
         return;
     }
 
-    int view_lines = height - 3;
-    int total = content_total_lines(st);
-    int max_scroll = total > view_lines ? total - view_lines : 0;
-    int scroll = st->scroll;
-    if (scroll > max_scroll) {
-        scroll = max_scroll;
+    const char *p = regex;
+    size_t o = 0;
+
+    /* skip leading ^ */
+    if (*p == '^') p++;
+    /* skip leading ( */
+    if (*p == '(') p++;
+    /* skip [Xx] case patterns like [Gg] */
+    if (*p == '[' && p[1] && p[2] == ']') {
+        out[o++] = (p[1] >= 'a' && p[1] <= 'z') ? p[1] - 32 : p[1];
+        p += 3;
     }
 
-    for (int i = 0; i < view_lines; i++) {
-        int line_idx = scroll + i;
-        if (line_idx >= total) {
-            break;
+    while (*p && o < out_sz - 1) {
+        /* stop at regex special chars that end the name */
+        if (*p == '$' || *p == ')' || *p == '|') break;
+        /* handle character classes like [.-] - just take first char */
+        if (*p == '[') {
+            if (p[1] && p[1] != ']') out[o++] = p[1];
+            while (*p && *p != ']') p++;
+            if (*p == ']') p++;
+            continue;
         }
-        const char *line = content_line_at(st->content, line_idx);
-        if (!line) {
-            break;
+        /* skip regex quantifiers and special sequences */
+        if (*p == '+' || *p == '*' || *p == '?') { p++; continue; }
+        if (*p == '.' && p[1] == '+') { p += 2; continue; }  /* .+ wildcard */
+        if (*p == '\\' && p[1] == 'd') { p += 2; continue; } /* \d digit */
+        /* unescape \. to . */
+        if (*p == '\\' && p[1]) {
+            p++;
+            out[o++] = *p++;
+            continue;
         }
-        char buf[1024];
-        int j = 0;
-        while (line[j] && line[j] != '\n' && j < (int)sizeof(buf) - 1) {
-            buf[j] = line[j];
-            j++;
+        out[o++] = *p++;
+    }
+    out[o] = '\0';
+
+    /* if empty, try to extract something useful */
+    if (out[0] == '\0' && regex[0]) {
+        /* just copy first word-like chars */
+        p = regex;
+        o = 0;
+        while (*p && o < out_sz - 1) {
+            if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                (*p >= '0' && *p <= '9') || *p == '-' || *p == '_') {
+                out[o++] = *p;
+            } else if (o > 0) {
+                break;  /* stop at first non-word char after we have something */
+            }
+            p++;
         }
-        buf[j] = '\0';
-        mvprintw(start_y + 1 + i, start_x + 1, "%.*s", width - 2, buf);
+        out[o] = '\0';
     }
 
+    /* capitalize first letter */
+    if (out[0] >= 'a' && out[0] <= 'z') {
+        out[0] -= 32;
+    }
+
+    /* leave empty if nothing extracted - caller handles fallback */
+}
+
+/* update rule's display_name from its match patterns */
+static void update_display_name(struct rule *r) {
+    char buf[64] = "";
+
+    /* try class regex first */
+    clean_class_name(r->match.class_re, buf, sizeof(buf));
+
+    /* fall back to title regex */
+    if (!buf[0]) {
+        clean_class_name(r->match.title_re, buf, sizeof(buf));
+    }
+
+    /* fall back to rule name */
+    if (!buf[0] && r->name) {
+        snprintf(buf, sizeof(buf), "%s", r->name);
+    }
+
+    /* final fallback */
+    if (!buf[0]) {
+        snprintf(buf, sizeof(buf), "(unnamed)");
+    }
+
+    free(r->display_name);
+    r->display_name = strdup(buf);
+}
+
+/* helper to clean tag (remove + prefix) */
+static const char *clean_tag(const char *tag) {
+    if (!tag) return "-";
+    if (tag[0] == '+') return tag + 1;
+    return tag;
+}
+
+/* rule list view */
+static void draw_rules_view(struct ui_state *st, int y, int h, int w) {
+    draw_box(y, 0, h, w, "Window Rules");
+
+    if (st->rules.count == 0) {
+        attron(COLOR_PAIR(COL_DIM));
+        mvprintw(y + h / 2, (w - 20) / 2, "No rules loaded");
+        attroff(COLOR_PAIR(COL_DIM));
+        return;
+    }
+
+    int visible = h - 3;  /* leave room for header */
+    int max_scroll = (int)st->rules.count > visible ? (int)st->rules.count - visible : 0;
+    if (st->scroll > max_scroll) st->scroll = max_scroll;
+    if (st->scroll < 0) st->scroll = 0;
+
+    /* ensure selected is visible */
+    if (st->selected < st->scroll) st->scroll = st->selected;
+    if (st->selected >= st->scroll + visible) st->scroll = st->selected - visible + 1;
+
+    /* column header */
+    attron(COLOR_PAIR(COL_DIM));
+    mvprintw(y + 1, 3, "%-16s %-12s %-6s %-8s %s", "Application", "Tag", "WS", "Status", "Options");
+    attroff(COLOR_PAIR(COL_DIM));
+
+    const char *last_tag = NULL;
+
+    for (int i = 0; i < visible && (st->scroll + i) < (int)st->rules.count; i++) {
+        int idx = st->scroll + i;
+        struct rule *r = &st->rules.rules[idx];
+        int row = y + 2 + i;
+
+        /* get status */
+        enum rule_status status = st->rule_status ? st->rule_status[idx] : RULE_OK;
+
+        /* use pre-computed display name */
+        const char *display = r->display_name ? r->display_name : "(unnamed)";
+        const char *tag = clean_tag(r->actions.tag);
+        const char *ws = r->actions.workspace ? r->actions.workspace : "-";
+
+        /* build options string - include extras count if any */
+        char opts[32] = "";
+        if (r->actions.float_set && r->actions.float_val) strcat(opts, "F ");
+        if (r->actions.center_set && r->actions.center_val) strcat(opts, "C ");
+        if (r->actions.size) strcat(opts, "S ");
+        if (r->actions.opacity) strcat(opts, "O ");
+        if (r->extras_count > 0) {
+            char extra_buf[24];
+            snprintf(extra_buf, sizeof(extra_buf), "+%zu", r->extras_count);
+            strcat(opts, extra_buf);
+        }
+        if (opts[0] == '\0') strcpy(opts, "-");
+
+        /* show tag separator if tag changed */
+        int show_tag = 1;
+        if (last_tag && r->actions.tag && strcmp(last_tag, r->actions.tag) == 0) {
+            show_tag = 0;
+        }
+        last_tag = r->actions.tag;
+
+        if (idx == st->selected) {
+            attron(COLOR_PAIR(COL_SELECT));
+            mvhline(row, 1, ' ', w - 2);
+        }
+
+        /* format row */
+        mvprintw(row, 3, "%-16.16s", display);
+
+        if (show_tag && tag[0] != '-') {
+            attron(A_BOLD);
+            mvprintw(row, 20, "%-12.12s", tag);
+            attroff(A_BOLD);
+            if (idx == st->selected) attron(COLOR_PAIR(COL_SELECT));
+        } else {
+            mvprintw(row, 20, "%-12.12s", show_tag ? tag : "");
+        }
+
+        mvprintw(row, 33, "%-6.6s", ws);
+
+        /* status column */
+        const char *status_str;
+        int status_color;
+        switch (status) {
+        case RULE_UNUSED:
+            status_str = "unused";
+            status_color = COL_WARN;
+            break;
+        case RULE_DUPLICATE:
+            status_str = "dup";
+            status_color = COL_ERROR;
+            break;
+        default:
+            status_str = "ok";
+            status_color = COL_DIM;
+            break;
+        }
+        if (idx != st->selected) attron(COLOR_PAIR(status_color));
+        mvprintw(row, 40, "%-8s", status_str);
+        if (idx != st->selected) attroff(COLOR_PAIR(status_color));
+
+        attron(COLOR_PAIR(COL_DIM));
+        if (idx != st->selected) {
+            mvprintw(row, 49, "%.15s", opts);
+        } else {
+            attroff(COLOR_PAIR(COL_DIM));
+            mvprintw(row, 49, "%.15s", opts);
+        }
+        attroff(COLOR_PAIR(COL_DIM));
+
+        if (idx == st->selected) {
+            attroff(COLOR_PAIR(COL_SELECT));
+        }
+    }
+
+    /* scrollbar */
     if (max_scroll > 0) {
-        int bar_height = view_lines;
-        int thumb = (bar_height * view_lines) / total;
-        if (thumb < 1) {
-            thumb = 1;
-        }
-        int thumb_pos = (bar_height * scroll) / total;
-        for (int i = 0; i < bar_height; i++) {
-            int y = start_y + 1 + i;
-            int x = start_x + width - 2;
+        int bar_h = visible;
+        int thumb = (bar_h * visible) / (int)st->rules.count;
+        if (thumb < 1) thumb = 1;
+        int thumb_pos = (bar_h * st->scroll) / (int)st->rules.count;
+
+        for (int i = 0; i < bar_h; i++) {
             if (i >= thumb_pos && i < thumb_pos + thumb) {
-                attron(COLOR_PAIR(4));
-                mvaddch(y, x, ' ');
-                attroff(COLOR_PAIR(4));
+                attron(COLOR_PAIR(COL_SELECT));
+                mvprintw(y + 2 + i, w - 1, "#");
+                attroff(COLOR_PAIR(COL_SELECT));
             } else {
-                mvaddch(y, x, ' ');
+                attron(COLOR_PAIR(COL_DIM));
+                mvprintw(y + 2 + i, w - 1, "|");
+                attroff(COLOR_PAIR(COL_DIM));
             }
         }
     }
+
+    /* footer hint */
+    attron(COLOR_PAIR(COL_DIM));
+    mvprintw(y + h - 1, 3, " Enter: Edit  /: Search  n: New ");
+    attroff(COLOR_PAIR(COL_DIM));
 }
 
-static void draw_footer(int start_y, int width) {
-    attron(COLOR_PAIR(2));
-    mvhline(start_y, 0, ' ', width);
-    mvprintw(start_y, 2, "Keys: ↑↓ menu  Enter run  PgUp/PgDn scroll  s settings  q quit");
-    attroff(COLOR_PAIR(2));
+/* rule detail panel */
+static void draw_rule_detail(struct ui_state *st, int y, int x, int h, int w) {
+    draw_box(y, x, h, w, "Rule Details");
+
+    if (st->selected < 0 || st->selected >= (int)st->rules.count) {
+        attron(COLOR_PAIR(COL_DIM));
+        mvprintw(y + h / 2, x + (w - 18) / 2, "No rule selected");
+        attroff(COLOR_PAIR(COL_DIM));
+        return;
+    }
+
+    struct rule *r = &st->rules.rules[st->selected];
+    int row = y + 2;
+    int col = x + 3;
+
+    /* use pre-computed display name */
+    const char *display = r->display_name ? r->display_name : "(unnamed)";
+
+    attron(A_BOLD | COLOR_PAIR(COL_ACCENT));
+    mvprintw(row++, col, "%s", display);
+    attroff(A_BOLD | COLOR_PAIR(COL_ACCENT));
+
+    row++;
+
+    /* matching */
+    attron(COLOR_PAIR(COL_DIM));
+    mvprintw(row++, col, "Matching");
+    attroff(COLOR_PAIR(COL_DIM));
+
+    if (r->match.class_re) {
+        mvprintw(row++, col + 2, "Class:  %.*s", w - 12, r->match.class_re);
+    }
+    if (r->match.title_re) {
+        mvprintw(row++, col + 2, "Title:  %.*s", w - 12, r->match.title_re);
+    }
+
+    row++;
+
+    /* actions */
+    attron(COLOR_PAIR(COL_DIM));
+    mvprintw(row++, col, "Actions");
+    attroff(COLOR_PAIR(COL_DIM));
+
+    if (r->actions.tag) {
+        mvprintw(row++, col + 2, "Tag:       %s", clean_tag(r->actions.tag));
+    }
+    if (r->actions.workspace) {
+        mvprintw(row++, col + 2, "Workspace: %s", r->actions.workspace);
+    }
+    if (r->actions.float_set) {
+        mvprintw(row++, col + 2, "Float:     %s", r->actions.float_val ? "Yes" : "No");
+    }
+    if (r->actions.center_set) {
+        mvprintw(row++, col + 2, "Center:    %s", r->actions.center_val ? "Yes" : "No");
+    }
+    if (r->actions.size) {
+        mvprintw(row++, col + 2, "Size:      %s", r->actions.size);
+    }
+    if (r->actions.move) {
+        mvprintw(row++, col + 2, "Position:  %s", r->actions.move);
+    }
+    if (r->actions.opacity) {
+        mvprintw(row++, col + 2, "Opacity:   %s", r->actions.opacity);
+    }
+
+    /* show extras if any */
+    if (r->extras_count > 0) {
+        row++;
+        attron(COLOR_PAIR(COL_ACCENT));
+        mvprintw(row++, col, "Other (%zu)", r->extras_count);
+        attroff(COLOR_PAIR(COL_ACCENT));
+
+        for (size_t i = 0; i < r->extras_count && row < y + h - 3; i++) {
+            mvprintw(row++, col + 2, "%-10.10s %.*s",
+                     r->extras[i].key, w - 16, r->extras[i].value);
+        }
+    }
+
+    /* hint at bottom */
+    attron(COLOR_PAIR(COL_DIM));
+    mvprintw(y + h - 2, col, "Press Enter to edit");
+    attroff(COLOR_PAIR(COL_DIM));
 }
 
-static void run_action(struct ui_state *st, int action) {
+/* active windows view */
+static void draw_windows_view(struct ui_state *st, int y, int h, int w) {
+    draw_box(y, 0, h, w, "Active Windows");
+
     struct outbuf out;
     struct action_opts opts = {st->suggest_rules, st->show_overlaps};
     outbuf_init(&out);
 
-    char *rules = expand_home(st->rules_path);
-    char *dotfiles = expand_home(st->dotfiles_path);
-    char *appmap = expand_home(st->appmap_path);
+    char *path = expand_path(st->rules_path);
+    active_windows_text(path ? path : st->rules_path, &opts, &out);
+    free(path);
 
-    switch (action) {
-    case 0:
-        summarize_rules_text(rules ? rules : st->rules_path, &out);
-        break;
-    case 1:
-        scan_dotfiles_text(dotfiles ? dotfiles : st->dotfiles_path,
-                           rules ? rules : st->rules_path,
-                           appmap ? appmap : st->appmap_path,
-                           &opts, &out);
-        break;
-    case 2:
-        active_windows_text(rules ? rules : st->rules_path, &opts, &out);
-        break;
-    default:
-        outbuf_printf(&out, "No action selected.\n");
-        break;
+    if (!out.data) {
+        attron(COLOR_PAIR(COL_DIM));
+        mvprintw(y + h / 2, (w - 24) / 2, "No windows found");
+        attroff(COLOR_PAIR(COL_DIM));
+        outbuf_free(&out);
+        return;
     }
 
-    content_set(st, out.data ? out.data : "(no output)\n");
+    /* render output */
+    int row = y + 1;
+    int max_row = y + h - 1;
+    const char *p = out.data;
+    int line = 0;
 
-    free(rules);
-    free(dotfiles);
-    free(appmap);
+    while (*p && row < max_row) {
+        if (line >= st->scroll) {
+            const char *end = strchr(p, '\n');
+            int len = end ? (int)(end - p) : (int)strlen(p);
+
+            if (strncmp(p, "Window:", 7) == 0) {
+                attron(A_BOLD | COLOR_PAIR(COL_ACCENT));
+            }
+            mvprintw(row, 2, "%.*s", w - 4, p);
+            if (strncmp(p, "Window:", 7) == 0) {
+                attroff(A_BOLD | COLOR_PAIR(COL_ACCENT));
+            }
+            row++;
+
+            p += len;
+            if (*p == '\n') p++;
+        } else {
+            const char *end = strchr(p, '\n');
+            p = end ? end + 1 : p + strlen(p);
+        }
+        line++;
+    }
+
     outbuf_free(&out);
 }
 
-static int edit_line(WINDOW *win, int y, int x, int width, char *buf, size_t cap) {
-    int len = (int)strlen(buf);
-    int pos = len;
-    keypad(win, TRUE);
-    curs_set(1);
+/* settings view */
+static void draw_settings_view(struct ui_state *st, int y, int h, int w) {
+    draw_box(y, 0, h, w, "Settings");
+
+    const char *labels[] = {"Rules path:", "Dotfiles:", "Appmap:", "Suggest rules:", "Show overlaps:"};
+    const char *values[] = {st->rules_path, st->dotfiles_path, st->appmap_path, NULL, NULL};
+
+    int row = y + 2;
+    for (int i = 0; i < 5; i++) {
+        if (i == st->selected) {
+            attron(COLOR_PAIR(COL_SELECT));
+            mvhline(row, 2, ' ', w - 4);
+        }
+
+        mvprintw(row, 4, "%-16s", labels[i]);
+
+        if (i < 3) {
+            mvprintw(row, 22, "%.*s", w - 26, values[i]);
+        } else if (i == 3) {
+            mvprintw(row, 22, "[%c]", st->suggest_rules ? 'x' : ' ');
+        } else {
+            mvprintw(row, 22, "[%c]", st->show_overlaps ? 'x' : ' ');
+        }
+
+        if (i == st->selected) {
+            attroff(COLOR_PAIR(COL_SELECT));
+        }
+        row += 2;
+    }
+}
+
+/* review view - uses cached data */
+static void draw_review_view(struct ui_state *st, int y, int h, int w) {
+    draw_box(y, 0, h, w, "Rules Review");
+
+    /* load data if not cached */
+    if (!st->review_loaded) {
+        /* show loading message */
+        attron(COLOR_PAIR(COL_DIM));
+        mvprintw(y + h / 2, (w - 15) / 2, "Loading...");
+        attroff(COLOR_PAIR(COL_DIM));
+        refresh();
+        load_review_data(st);
+    }
+
+    if (!st->review_text && st->missing.count == 0) {
+        attron(COLOR_PAIR(COL_DIM));
+        mvprintw(y + h / 2, (w - 20) / 2, "Review unavailable");
+        attroff(COLOR_PAIR(COL_DIM));
+        return;
+    }
+
+    /* render output */
+    int row = y + 1;
+    int max_row = y + h - 1;
+
+    if (st->review_text) {
+        const char *p = st->review_text;
+        while (*p && row < max_row - (int)st->missing.count - 3) {
+            const char *end = strchr(p, '\n');
+            int len = end ? (int)(end - p) : (int)strlen(p);
+
+            /* highlight headers */
+            if (strncmp(p, "===", 3) == 0 || strncmp(p, "Summary", 7) == 0 ||
+                strncmp(p, "Potentially", 11) == 0) {
+                attron(A_BOLD | COLOR_PAIR(COL_ACCENT));
+            }
+            mvprintw(row, 2, "%.*s", w - 4 < len ? w - 4 : len, p);
+            if (strncmp(p, "===", 3) == 0 || strncmp(p, "Summary", 7) == 0 ||
+                strncmp(p, "Potentially", 11) == 0) {
+                attroff(A_BOLD | COLOR_PAIR(COL_ACCENT));
+            }
+            row++;
+
+            p += len;
+            if (*p == '\n') p++;
+        }
+    }
+
+    /* show missing rules */
+    if (st->missing.count > 0 && row < max_row - 2) {
+        row++;
+        attron(A_BOLD | COLOR_PAIR(COL_ERROR));
+        mvprintw(row++, 2, "Missing rules (installed apps without rules):");
+        attroff(A_BOLD | COLOR_PAIR(COL_ERROR));
+
+        for (size_t i = 0; i < st->missing.count && row < max_row; i++) {
+            struct missing_rule *mr = &st->missing.items[i];
+            attron(COLOR_PAIR(COL_WARN));
+            mvprintw(row++, 4, "%-16s [%s] %s",
+                     mr->app_name ? mr->app_name : "?",
+                     mr->source ? mr->source : "?",
+                     mr->group ? mr->group : "");
+            attroff(COLOR_PAIR(COL_WARN));
+        }
+    }
+}
+
+/* simple yes/no confirmation dialog */
+static int confirm_dialog(int scr_h, int scr_w, const char *title, const char *msg) {
+    int h = 7, w = 50;
+    int y = (scr_h - h) / 2;
+    int x = (scr_w - w) / 2;
+
     while (1) {
-        mvwprintw(win, y, x, "%*s", width, "");
-        mvwprintw(win, y, x, "%.*s", width, buf);
-        wmove(win, y, x + pos);
-        wrefresh(win);
+        attron(COLOR_PAIR(COL_BORDER));
+        for (int i = 0; i < h; i++) {
+            mvhline(y + i, x, ' ', w);
+        }
+        draw_box(y, x, h, w, title);
+        attroff(COLOR_PAIR(COL_BORDER));
 
-        int ch = wgetch(win);
-        if (ch == 27 || ch == '\n' || ch == KEY_ENTER) {
-            curs_set(0);
-            return ch == 27 ? 0 : 1;
-        }
-        if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
-            if (pos > 0) {
-                memmove(buf + pos - 1, buf + pos, (size_t)(len - pos + 1));
-                pos--;
-                len--;
+        mvprintw(y + 2, x + 3, "%.44s", msg);
+
+        /* clickable buttons */
+        attron(COLOR_PAIR(COL_SELECT));
+        mvprintw(y + 4, x + 10, " Yes ");
+        attroff(COLOR_PAIR(COL_SELECT));
+        attron(COLOR_PAIR(COL_DIM));
+        mvprintw(y + 4, x + 20, " No ");
+        attroff(COLOR_PAIR(COL_DIM));
+
+        attron(COLOR_PAIR(COL_DIM));
+        mvprintw(y + 5, x + 3, "y/n or click");
+        attroff(COLOR_PAIR(COL_DIM));
+
+        refresh();
+
+        int ch = getch();
+        if (ch == 'y' || ch == 'Y') return 1;
+        if (ch == 'n' || ch == 'N' || ch == 27 || ch == 'q') return 0;
+        if (ch == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                int click = event.bstate & (BUTTON1_CLICKED | BUTTON1_PRESSED | BUTTON1_RELEASED);
+                if (click && event.y == y + 4) {
+                    if (event.x >= x + 10 && event.x < x + 16) return 1;  /* Yes */
+                    if (event.x >= x + 20 && event.x < x + 25) return 0;  /* No */
+                }
             }
-            continue;
-        }
-        if (ch == KEY_LEFT) {
-            if (pos > 0) {
-                pos--;
-            }
-            continue;
-        }
-        if (ch == KEY_RIGHT) {
-            if (pos < len) {
-                pos++;
-            }
-            continue;
-        }
-        if (isprint(ch) && (size_t)len + 1 < cap) {
-            memmove(buf + pos + 1, buf + pos, (size_t)(len - pos + 1));
-            buf[pos] = (char)ch;
-            pos++;
-            len++;
         }
     }
 }
 
-static void rule_editor_init(struct rule_editor *ed) {
-    memset(ed, 0, sizeof(*ed));
-    snprintf(ed->name, sizeof(ed->name), "rule-new");
-}
+/* write a rule to file in hyprland format */
+static int write_rule_to_file(const char *path, const struct rule *r, const char *mode) {
+    FILE *f = fopen(path, mode);
+    if (!f) return -1;
 
-static char *rule_editor_snippet(const struct rule_editor *ed) {
-    struct outbuf out;
-    outbuf_init(&out);
+    fprintf(f, "windowrule {\n");
+    if (r->name) fprintf(f, "    name = %s\n", r->name);
+    if (r->match.class_re) fprintf(f, "    match:class = %s\n", r->match.class_re);
+    if (r->match.title_re) fprintf(f, "    match:title = %s\n", r->match.title_re);
+    if (r->match.initial_class_re) fprintf(f, "    match:initial_class = %s\n", r->match.initial_class_re);
+    if (r->match.initial_title_re) fprintf(f, "    match:initial_title = %s\n", r->match.initial_title_re);
+    if (r->match.tag_re) fprintf(f, "    match:tag = %s\n", r->match.tag_re);
+    if (r->actions.tag) fprintf(f, "    tag = %s\n", r->actions.tag);
+    if (r->actions.workspace) fprintf(f, "    workspace = %s\n", r->actions.workspace);
+    if (r->actions.float_set) fprintf(f, "    float = %s\n", r->actions.float_val ? "true" : "false");
+    if (r->actions.center_set) fprintf(f, "    center = %s\n", r->actions.center_val ? "true" : "false");
+    if (r->actions.size) fprintf(f, "    size = %s\n", r->actions.size);
+    if (r->actions.move) fprintf(f, "    move = %s\n", r->actions.move);
+    if (r->actions.opacity) fprintf(f, "    opacity = %s\n", r->actions.opacity);
+    /* write extras */
+    for (size_t i = 0; i < r->extras_count; i++) {
+        fprintf(f, "    %s = %s\n", r->extras[i].key, r->extras[i].value);
+    }
+    fprintf(f, "}\n\n");
 
-    outbuf_printf(&out, "{\n");
-    if (ed->name[0]) {
-        outbuf_printf(&out, "  \"name\": \"%s\"", ed->name);
-    } else {
-        outbuf_printf(&out, "  \"name\": \"rule-new\"");
-    }
-
-    if (ed->match_class[0]) {
-        outbuf_printf(&out, ",\n  \"match:class\": \"%s\"", ed->match_class);
-    }
-    if (ed->match_title[0]) {
-        outbuf_printf(&out, ",\n  \"match:title\": \"%s\"", ed->match_title);
-    }
-    if (ed->tag[0]) {
-        outbuf_printf(&out, ",\n  \"tag\": \"%s\"", ed->tag);
-    }
-    if (ed->workspace[0]) {
-        outbuf_printf(&out, ",\n  \"workspace\": \"%s\"", ed->workspace);
-    }
-    if (ed->opacity[0]) {
-        outbuf_printf(&out, ",\n  \"opacity\": \"%s\"", ed->opacity);
-    }
-    if (ed->size[0]) {
-        outbuf_printf(&out, ",\n  \"size\": \"%s\"", ed->size);
-    }
-    if (ed->move[0]) {
-        outbuf_printf(&out, ",\n  \"move\": \"%s\"", ed->move);
-    }
-    if (ed->set_float) {
-        outbuf_printf(&out, ",\n  \"float\": \"yes\"");
-    }
-    if (ed->set_center) {
-        outbuf_printf(&out, ",\n  \"center\": \"yes\"");
-    }
-    outbuf_printf(&out, "\n}\n");
-
-    char *snippet = out.data ? strdup(out.data) : NULL;
-    outbuf_free(&out);
-    return snippet;
-}
-
-static int rule_editor_write_snippet(const char *path, const char *snippet) {
-    if (!path || !snippet) {
-        return -1;
-    }
-    FILE *f = fopen(path, "a");
-    if (!f) {
-        return -1;
-    }
-    fprintf(f, "%s\n", snippet);
     fclose(f);
     return 0;
 }
 
-static void rule_editor_screen(struct ui_state *st) {
-    int height, width;
-    getmaxyx(stdscr, height, width);
+/* create backup of rules file */
+static int create_backup(struct ui_state *st) {
+    char *expanded = expand_path(st->rules_path);
+    const char *src = expanded ? expanded : st->rules_path;
 
-    int win_h = 22;
-    int win_w = width - 6;
-    if (win_w < 70) {
-        win_w = 70;
+    /* generate backup path with timestamp */
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm);
+
+    const char *dot = strrchr(src, '.');
+    const char *slash = strrchr(src, '/');
+    char tmp[1024];
+    if (dot && (!slash || dot > slash)) {
+        snprintf(tmp, sizeof(tmp), "%.*s.backup_%s%s",
+                 (int)(dot - src), src, timestamp, dot);
+    } else {
+        snprintf(tmp, sizeof(tmp), "%s.backup_%s", src, timestamp);
     }
-    int start_y = (height - win_h) / 2;
-    int start_x = (width - win_w) / 2;
+    strncpy(st->backup_path, tmp, sizeof(st->backup_path) - 1);
+    st->backup_path[sizeof(st->backup_path) - 1] = '\0';
 
-    WINDOW *win = newwin(win_h, win_w, start_y, start_x);
-    keypad(win, TRUE);
+    /* copy file */
+    FILE *in = fopen(src, "rb");
+    if (!in) {
+        free(expanded);
+        return -1;
+    }
+    FILE *out = fopen(st->backup_path, "wb");
+    if (!out) {
+        fclose(in);
+        free(expanded);
+        return -1;
+    }
 
-    struct rule_editor ed;
-    rule_editor_init(&ed);
-    int selected = 0;
-    int total_items = 10;
-    const char *labels[] = {
-        "Name",
-        "Match class",
-        "Match title",
-        "Tag",
-        "Workspace",
-        "Opacity",
-        "Size",
-        "Move",
-        "Float",
-        "Center",
-    };
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        fwrite(buf, 1, n, out);
+    }
+
+    fclose(in);
+    fclose(out);
+    free(expanded);
+
+    st->backup_created = 1;
+    return 0;
+}
+
+/* save all rules to file */
+static int save_rules(struct ui_state *st) {
+    char *expanded = expand_path(st->rules_path);
+    const char *path = expanded ? expanded : st->rules_path;
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        free(expanded);
+        return -1;
+    }
+
+    /* write header comment */
+    fprintf(f, "# Window Rules - managed by hyprwindows\n");
+    fprintf(f, "# See https://wiki.hyprland.org/Configuring/Window-Rules/\n\n");
+
+    /* write each rule */
+    for (size_t i = 0; i < st->rules.count; i++) {
+        struct rule *r = &st->rules.rules[i];
+
+        fprintf(f, "windowrule {\n");
+        if (r->name) fprintf(f, "    name = %s\n", r->name);
+        if (r->match.class_re) fprintf(f, "    match:class = %s\n", r->match.class_re);
+        if (r->match.title_re) fprintf(f, "    match:title = %s\n", r->match.title_re);
+        if (r->match.initial_class_re) fprintf(f, "    match:initial_class = %s\n", r->match.initial_class_re);
+        if (r->match.initial_title_re) fprintf(f, "    match:initial_title = %s\n", r->match.initial_title_re);
+        if (r->match.tag_re) fprintf(f, "    match:tag = %s\n", r->match.tag_re);
+        if (r->actions.tag) fprintf(f, "    tag = %s\n", r->actions.tag);
+        if (r->actions.workspace) fprintf(f, "    workspace = %s\n", r->actions.workspace);
+        if (r->actions.float_set) fprintf(f, "    float = %s\n", r->actions.float_val ? "true" : "false");
+        if (r->actions.center_set) fprintf(f, "    center = %s\n", r->actions.center_val ? "true" : "false");
+        if (r->actions.size) fprintf(f, "    size = %s\n", r->actions.size);
+        if (r->actions.move) fprintf(f, "    move = %s\n", r->actions.move);
+        if (r->actions.opacity) fprintf(f, "    opacity = %s\n", r->actions.opacity);
+        for (size_t j = 0; j < r->extras_count; j++) {
+            fprintf(f, "    %s = %s\n", r->extras[j].key, r->extras[j].value);
+        }
+        fprintf(f, "}\n\n");
+    }
+
+    fclose(f);
+    free(expanded);
+
+    st->modified = 0;
+    return 0;
+}
+
+/* get disabled rules file path (same dir as rules, with .disabled suffix) */
+static void get_disabled_path(const char *rules_path, char *out, size_t out_sz) {
+    if (out_sz < 20) return;  /* sanity check */
+    /* find last dot or end */
+    const char *dot = strrchr(rules_path, '.');
+    const char *slash = strrchr(rules_path, '/');
+    size_t path_len = strlen(rules_path);
+    if (path_len > out_sz - 15) path_len = out_sz - 15;  /* leave room for .disabled + ext */
+
+    if (dot && (!slash || dot > slash)) {
+        size_t base_len = (size_t)(dot - rules_path);
+        if (base_len > path_len) base_len = path_len;
+        snprintf(out, out_sz, "%.*s.disabled%s", (int)base_len, rules_path, dot);
+    } else {
+        snprintf(out, out_sz, "%.*s.disabled", (int)path_len, rules_path);
+    }
+}
+
+/* rule edit modal - returns 1 if rule was modified */
+static int edit_rule_modal(struct rule *r, int scr_h, int scr_w) {
+    /* adjust height based on extras */
+    int base_h = 20;  /* increased for name field + derived preview */
+    int extras_h = r->extras_count > 0 ? (int)r->extras_count + 2 : 0;
+    int h = base_h + extras_h;
+    if (h > scr_h - 4) h = scr_h - 4;
+    int w = 60;
+    int y = (scr_h - h) / 2;
+    int x = (scr_w - w) / 2;
+
+    /* fields to edit - F_DERIVED is special (not a real field, just clickable) */
+    enum { F_NAME, F_DERIVED, F_CLASS, F_TITLE, F_TAG, F_WORKSPACE, F_FLOAT, F_CENTER, F_SIZE, F_OPACITY, F_COUNT };
+    int field = 0;
+
+    char name_buf[128], class_buf[128], title_buf[128], tag_buf[64], ws_buf[32], size_buf[32], opacity_buf[32];
+    /* original values for change detection */
+    char orig_name[128], orig_class[128], orig_title[128], orig_tag[64], orig_ws[32], orig_size[32], orig_opacity[32];
+    int float_val = r->actions.float_set ? r->actions.float_val : 0;
+    int center_val = r->actions.center_set ? r->actions.center_val : 0;
+    int orig_float = float_val, orig_center = center_val;
+
+    /* init buffers from rule */
+    snprintf(name_buf, sizeof(name_buf), "%s", r->name ? r->name : "");
+    snprintf(class_buf, sizeof(class_buf), "%s", r->match.class_re ? r->match.class_re : "");
+    snprintf(title_buf, sizeof(title_buf), "%s", r->match.title_re ? r->match.title_re : "");
+    snprintf(tag_buf, sizeof(tag_buf), "%s", r->actions.tag ? r->actions.tag : "");
+    snprintf(ws_buf, sizeof(ws_buf), "%s", r->actions.workspace ? r->actions.workspace : "");
+    snprintf(size_buf, sizeof(size_buf), "%s", r->actions.size ? r->actions.size : "");
+    snprintf(opacity_buf, sizeof(opacity_buf), "%s", r->actions.opacity ? r->actions.opacity : "");
+    /* save originals */
+    snprintf(orig_name, sizeof(orig_name), "%s", name_buf);
+    snprintf(orig_class, sizeof(orig_class), "%s", class_buf);
+    snprintf(orig_title, sizeof(orig_title), "%s", title_buf);
+    snprintf(orig_tag, sizeof(orig_tag), "%s", tag_buf);
+    snprintf(orig_ws, sizeof(orig_ws), "%s", ws_buf);
+    snprintf(orig_size, sizeof(orig_size), "%s", size_buf);
+    snprintf(orig_opacity, sizeof(orig_opacity), "%s", opacity_buf);
+
+    int editing = 0;  /* 0 = navigating, 1 = editing text field */
 
     while (1) {
-        werase(win);
-        box(win, 0, 0);
-        wattron(win, A_BOLD | COLOR_PAIR(1));
-        mvwprintw(win, 0, 2, " Rule Editor ");
-        wattroff(win, A_BOLD | COLOR_PAIR(1));
+        /* draw modal box */
+        attron(COLOR_PAIR(COL_BORDER));
+        for (int i = 0; i < h; i++) {
+            mvhline(y + i, x, ' ', w);
+        }
+        draw_box(y, x, h, w, "Edit Rule");
+        attroff(COLOR_PAIR(COL_BORDER));
 
-        for (int i = 0; i < total_items; i++) {
-            int y = 2 + i;
-            if (i == selected) {
-                wattron(win, COLOR_PAIR(4));
-                mvwhline(win, y, 1, ' ', win_w - 2);
-                wattroff(win, COLOR_PAIR(4));
-            }
-            mvwprintw(win, y, 2, "%-12s", labels[i]);
-            if (i == 0) {
-                mvwprintw(win, y, 16, "%.*s", win_w - 18, ed.name);
-            } else if (i == 1) {
-                mvwprintw(win, y, 16, "%.*s", win_w - 18, ed.match_class);
-            } else if (i == 2) {
-                mvwprintw(win, y, 16, "%.*s", win_w - 18, ed.match_title);
-            } else if (i == 3) {
-                mvwprintw(win, y, 16, "%.*s", win_w - 18, ed.tag);
-            } else if (i == 4) {
-                mvwprintw(win, y, 16, "%.*s", win_w - 18, ed.workspace);
-            } else if (i == 5) {
-                mvwprintw(win, y, 16, "%.*s", win_w - 18, ed.opacity);
-            } else if (i == 6) {
-                mvwprintw(win, y, 16, "%.*s", win_w - 18, ed.size);
-            } else if (i == 7) {
-                mvwprintw(win, y, 16, "%.*s", win_w - 18, ed.move);
-            } else if (i == 8) {
-                mvwprintw(win, y, 16, "[%c]", ed.set_float ? 'x' : ' ');
-            } else if (i == 9) {
-                mvwprintw(win, y, 16, "[%c]", ed.set_center ? 'x' : ' ');
-            }
+        /* compute derived name for preview - same logic as update_display_name */
+        char derived[64] = "";
+        clean_class_name(class_buf, derived, sizeof(derived));
+        if (!derived[0]) {
+            clean_class_name(title_buf, derived, sizeof(derived));
         }
+        if (!derived[0]) snprintf(derived, sizeof(derived), "(unnamed)");
 
-        mvwprintw(win, win_h - 3, 2, "Enter=edit  Space=toggle  g=generate  w=save snippet  Esc=close");
-        wrefresh(win);
+        /* check which fields changed */
+        int changed[F_COUNT] = {0};
+        changed[F_NAME] = strcmp(name_buf, orig_name) != 0;
+        changed[F_CLASS] = strcmp(class_buf, orig_class) != 0;
+        changed[F_TITLE] = strcmp(title_buf, orig_title) != 0;
+        changed[F_TAG] = strcmp(tag_buf, orig_tag) != 0;
+        changed[F_WORKSPACE] = strcmp(ws_buf, orig_ws) != 0;
+        changed[F_FLOAT] = (float_val != orig_float);
+        changed[F_CENTER] = (center_val != orig_center);
+        changed[F_SIZE] = strcmp(size_buf, orig_size) != 0;
+        changed[F_OPACITY] = strcmp(opacity_buf, orig_opacity) != 0;
 
-        int ch = wgetch(win);
-        if (ch == 27 || ch == 'q') {
-            break;
-        }
-        if (ch == KEY_UP) {
-            if (selected > 0) {
-                selected--;
-            }
-            continue;
-        }
-        if (ch == KEY_DOWN) {
-            if (selected < total_items - 1) {
-                selected++;
-            }
-            continue;
-        }
-        if (ch == ' ' && (selected == 8 || selected == 9)) {
-            if (selected == 8) {
-                ed.set_float = !ed.set_float;
-            } else if (selected == 9) {
-                ed.set_center = !ed.set_center;
-            }
-            continue;
-        }
-        if (ch == 'g' || ch == 'G') {
-            char *snippet = rule_editor_snippet(&ed);
-            if (snippet) {
-                content_set(st, snippet);
-                free(snippet);
-            }
-            continue;
-        }
-        if (ch == 'w' || ch == 'W') {
-            char *snippet = rule_editor_snippet(&ed);
-            if (snippet) {
-                const char *snippet_path = "data/rule_snippet.jsonc";
-                if (rule_editor_write_snippet(snippet_path, snippet) == 0) {
-                    content_set(st, "Snippet saved to data/rule_snippet.jsonc\n");
+        /* draw fields */
+        int row = y + 2;
+        const char *labels[] = {"Name:", "", "Class:", "Title:", "Tag:", "Workspace:", "Float:", "Center:", "Size:", "Opacity:"};
+        char *bufs[] = {name_buf, NULL, class_buf, title_buf, tag_buf, ws_buf, NULL, NULL, size_buf, opacity_buf};
+
+        for (int i = 0; i < F_COUNT; i++) {
+            /* F_DERIVED is the derived name row */
+            if (i == F_DERIVED) {
+                if (field == F_DERIVED) attron(COLOR_PAIR(COL_ACCENT));
+                else attron(COLOR_PAIR(COL_DIM));
+                mvprintw(row, x + 2, "  → %-38.38s", derived);
+                if (field == F_DERIVED) {
+                    mvprintw(row, x + 44, "[Enter to use]");
+                    attroff(COLOR_PAIR(COL_ACCENT));
                 } else {
-                    content_set(st, "Failed to save snippet to data/rule_snippet.jsonc\n");
+                    attroff(COLOR_PAIR(COL_DIM));
                 }
-                free(snippet);
+                row++;
+                continue;
+            }
+
+            if (i == field) attron(COLOR_PAIR(COL_SELECT));
+            else attron(COLOR_PAIR(COL_NORMAL));
+
+            /* show * for changed fields */
+            char label[16];
+            snprintf(label, sizeof(label), "%s%s", changed[i] ? "*" : " ", labels[i]);
+            mvprintw(row, x + 1, "%-12s", label);
+
+            if (i == F_FLOAT) {
+                mvprintw(row, x + 14, "[%c] %s", float_val ? 'x' : ' ', float_val ? "Yes" : "No");
+            } else if (i == F_CENTER) {
+                mvprintw(row, x + 14, "[%c] %s", center_val ? 'x' : ' ', center_val ? "Yes" : "No");
+            } else {
+                /* show field value, with cursor indicator if editing */
+                if (editing && i == field) {
+                    mvprintw(row, x + 14, "%s_", bufs[i]);
+                    clrtoeol();
+                } else {
+                    mvprintw(row, x + 14, "%-40.40s", bufs[i]);
+                }
+            }
+
+            if (i == field) attroff(COLOR_PAIR(COL_SELECT));
+            else attroff(COLOR_PAIR(COL_NORMAL));
+            row++;
+        }
+
+        /* show extras (read-only) */
+        if (r->extras_count > 0) {
+            row++;
+            attron(COLOR_PAIR(COL_ACCENT));
+            mvprintw(row++, x + 2, "Other properties:");
+            attroff(COLOR_PAIR(COL_ACCENT));
+
+            attron(COLOR_PAIR(COL_DIM));
+            for (size_t i = 0; i < r->extras_count && row < y + h - 4; i++) {
+                mvprintw(row++, x + 4, "%-12.12s = %.30s", r->extras[i].key, r->extras[i].value);
+            }
+            attroff(COLOR_PAIR(COL_DIM));
+        }
+
+        /* help - context sensitive */
+        attron(COLOR_PAIR(COL_DIM));
+        if (editing) {
+            mvprintw(y + h - 3, x + 2, "Type to edit, Backspace to delete");
+            mvprintw(y + h - 2, x + 2, "Enter:Done  Esc:Cancel edit");
+        } else {
+            mvprintw(y + h - 3, x + 2, "↑↓:Select  Enter:Edit  Space:Toggle");
+            mvprintw(y + h - 2, x + 2, "s:Save     q:Cancel");
+        }
+        attroff(COLOR_PAIR(COL_DIM));
+
+        refresh();
+
+        int ch = getch();
+
+        if (editing && bufs[field]) {
+            char *buf = bufs[field];
+            size_t len = strlen(buf);
+            if (ch == '\n' || ch == KEY_ENTER) {
+                editing = 0;
+                curs_set(0);
+            } else if (ch == 27) {  /* ESC - cancel edit */
+                editing = 0;
+                curs_set(0);
+            } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                if (len > 0) buf[len - 1] = '\0';
+            } else if (ch >= 32 && ch < 127 && len < 126) {
+                buf[len] = (char)ch;
+                buf[len + 1] = '\0';
             }
             continue;
         }
-        if (ch == '\n' || ch == KEY_ENTER) {
-            if (selected == 0) {
-                edit_line(win, 2 + selected, 16, win_w - 18, ed.name, sizeof(ed.name));
-            } else if (selected == 1) {
-                edit_line(win, 2 + selected, 16, win_w - 18, ed.match_class, sizeof(ed.match_class));
-            } else if (selected == 2) {
-                edit_line(win, 2 + selected, 16, win_w - 18, ed.match_title, sizeof(ed.match_title));
-            } else if (selected == 3) {
-                edit_line(win, 2 + selected, 16, win_w - 18, ed.tag, sizeof(ed.tag));
-            } else if (selected == 4) {
-                edit_line(win, 2 + selected, 16, win_w - 18, ed.workspace, sizeof(ed.workspace));
-            } else if (selected == 5) {
-                edit_line(win, 2 + selected, 16, win_w - 18, ed.opacity, sizeof(ed.opacity));
-            } else if (selected == 6) {
-                edit_line(win, 2 + selected, 16, win_w - 18, ed.size, sizeof(ed.size));
-            } else if (selected == 7) {
-                edit_line(win, 2 + selected, 16, win_w - 18, ed.move, sizeof(ed.move));
+
+        /* mouse events in edit modal */
+        if (ch == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                int click = event.bstate & (BUTTON1_CLICKED | BUTTON1_PRESSED | BUTTON1_RELEASED);
+                int dblclick = event.bstate & BUTTON1_DOUBLE_CLICKED;
+
+                /* click/double-click on a field - rows map directly to F_* enum now */
+                if ((click || dblclick) && event.x >= x && event.x < x + w) {
+                    int clicked_row = event.y - (y + 2);
+                    if (clicked_row >= 0 && clicked_row < F_COUNT) {
+                        field = clicked_row;
+                        /* handle derived - copy to name */
+                        if (field == F_DERIVED) {
+                            snprintf(name_buf, sizeof(name_buf), "%s", derived);
+                            field = F_NAME;  /* move back to name field */
+                        }
+                        /* toggle checkboxes on click */
+                        else if (field == F_FLOAT) float_val = !float_val;
+                        else if (field == F_CENTER) center_val = !center_val;
+                        /* double-click to edit text */
+                        else if (dblclick && bufs[field]) {
+                            editing = 1;
+                            curs_set(1);
+                        }
+                    }
+                }
+                /* scroll wheel to navigate fields */
+                if (event.bstate & BUTTON4_PRESSED && field > 0) field--;
+                if (event.bstate & BUTTON5_PRESSED && field < F_COUNT - 1) field++;
             }
+            continue;
+        }
+
+        /* navigation mode */
+        if (ch == KEY_UP && field > 0) field--;
+        else if (ch == KEY_DOWN && field < F_COUNT - 1) field++;
+        else if (ch == '\n' || ch == KEY_ENTER) {
+            /* derived row - copy to name */
+            if (field == F_DERIVED) {
+                snprintf(name_buf, sizeof(name_buf), "%s", derived);
+                field = F_NAME;
+            }
+            else if (field == F_FLOAT) { float_val = !float_val; }
+            else if (field == F_CENTER) { center_val = !center_val; }
+            else if (bufs[field]) { editing = 1; curs_set(1); }
+        }
+        else if (ch == ' ') {
+            if (field == F_FLOAT) { float_val = !float_val; }
+            else if (field == F_CENTER) { center_val = !center_val; }
+        }
+        else if (ch == 's' || ch == 'S') {
+            /* save changes to rule */
+            free(r->name); r->name = name_buf[0] ? strdup(name_buf) : NULL;
+            free(r->match.class_re); r->match.class_re = class_buf[0] ? strdup(class_buf) : NULL;
+            free(r->match.title_re); r->match.title_re = title_buf[0] ? strdup(title_buf) : NULL;
+            free(r->actions.tag); r->actions.tag = tag_buf[0] ? strdup(tag_buf) : NULL;
+            free(r->actions.workspace); r->actions.workspace = ws_buf[0] ? strdup(ws_buf) : NULL;
+            free(r->actions.size); r->actions.size = size_buf[0] ? strdup(size_buf) : NULL;
+            free(r->actions.opacity); r->actions.opacity = opacity_buf[0] ? strdup(opacity_buf) : NULL;
+            r->actions.float_set = 1; r->actions.float_val = float_val;
+            r->actions.center_set = 1; r->actions.center_val = center_val;
+            update_display_name(r);  /* update derived display name */
+            curs_set(0);
+            return 1;
+        }
+        else if (ch == 'q' || ch == 'Q' || ch == 27) {
+            curs_set(0);
+            return 0;
         }
     }
-
-    delwin(win);
 }
 
-static void settings_screen(struct ui_state *st) {
-    int height, width;
-    getmaxyx(stdscr, height, width);
-
-    int win_h = 14;
-    int win_w = width - 10;
-    if (win_w < 60) {
-        win_w = 60;
-    }
-    int start_y = (height - win_h) / 2;
-    int start_x = (width - win_w) / 2;
-
-    WINDOW *win = newwin(win_h, win_w, start_y, start_x);
-    keypad(win, TRUE);
-
-    int selected = 0;
-    int total_items = 5;
-    const char *labels[] = {
-        "Rules path",
-        "Dotfiles path",
-        "Appmap path",
-        "Suggest rules",
-        "Show overlaps",
-    };
-
-    while (1) {
-        werase(win);
-        box(win, 0, 0);
-        wattron(win, A_BOLD | COLOR_PAIR(1));
-        mvwprintw(win, 0, 2, " Settings ");
-        wattroff(win, A_BOLD | COLOR_PAIR(1));
-
-        for (int i = 0; i < total_items; i++) {
-            int y = 2 + i * 2;
-            if (i == selected) {
-                wattron(win, COLOR_PAIR(4));
-                mvwhline(win, y, 1, ' ', win_w - 2);
-                wattroff(win, COLOR_PAIR(4));
-            }
-            mvwprintw(win, y, 2, "%s", labels[i]);
-            if (i == 0) {
-                mvwprintw(win, y, 18, "%.*s", win_w - 22, st->rules_path);
-            } else if (i == 1) {
-                mvwprintw(win, y, 18, "%.*s", win_w - 22, st->dotfiles_path);
-            } else if (i == 2) {
-                mvwprintw(win, y, 18, "%.*s", win_w - 22, st->appmap_path);
-            } else if (i == 3) {
-                mvwprintw(win, y, 18, "[%c]", st->suggest_rules ? 'x' : ' ');
-            } else if (i == 4) {
-                mvwprintw(win, y, 18, "[%c]", st->show_overlaps ? 'x' : ' ');
-            }
-        }
-
-        mvwprintw(win, win_h - 2, 2, "Enter=edit  Space=toggle  Esc=close");
-        wrefresh(win);
-
-        int ch = wgetch(win);
-        if (ch == 27 || ch == 'q') {
-            break;
-        }
-        if (ch == KEY_UP) {
-            if (selected > 0) {
-                selected--;
-            }
-            continue;
-        }
-        if (ch == KEY_DOWN) {
-            if (selected < total_items - 1) {
-                selected++;
-            }
-            continue;
-        }
-        if (ch == ' ' && selected >= 3) {
-            if (selected == 3) {
-                st->suggest_rules = !st->suggest_rules;
-            } else if (selected == 4) {
-                st->show_overlaps = !st->show_overlaps;
-            }
-            continue;
-        }
-        if (ch == '\n' || ch == KEY_ENTER) {
-            if (selected == 0) {
-                edit_line(win, 2 + selected * 2, 18, win_w - 22, st->rules_path, sizeof(st->rules_path));
-            } else if (selected == 1) {
-                edit_line(win, 2 + selected * 2, 18, win_w - 22, st->dotfiles_path, sizeof(st->dotfiles_path));
-            } else if (selected == 2) {
-                edit_line(win, 2 + selected * 2, 18, win_w - 22, st->appmap_path, sizeof(st->appmap_path));
-            }
-        }
-    }
-
-    delwin(win);
-}
-
+/* splash screen */
 static void draw_splash(int height, int width) {
     const char *lines[] = {
-        "██╗  ██╗██╗   ██╗██████╗ ██████╗ ██╗    ██╗██╗███╗   ██╗",
-        "██║  ██║██║   ██║██╔══██╗██╔══██╗██║    ██║██║████╗  ██║",
-        "███████║██║   ██║██████╔╝██████╔╝██║ █╗ ██║██║██╔██╗ ██║",
-        "██╔══██║██║   ██║██╔══██╗██╔══██╗██║███╗██║██║██║╚██╗██║",
-        "██║  ██║╚██████╔╝██║  ██║██║  ██║╚███╔███╔╝██║██║ ╚████║",
-        "╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝╚═╝  ╚═══╝",
+        " _                        _           _                    ",
+        "| |__  _   _ _ __  _ __  (_)_ __   __| | _____      _____  ",
+        "| '_ \\| | | | '_ \\| '__| | | '_ \\ / _` |/ _ \\ \\ /\\ / / __| ",
+        "| | | | |_| | |_) | |    | | | | | (_| | (_) \\ V  V /\\__ \\ ",
+        "|_| |_|\\__, | .__/|_|    |_|_| |_|\\__,_|\\___/ \\_/\\_/ |___/ ",
+        "       |___/|_|                                            ",
         "",
-        "Hyprland Window Rules",
+        "Window Rules Manager",
+        "",
+        "Press any key to continue...",
     };
-    int lines_count = (int)(sizeof(lines) / sizeof(lines[0]));
-    int start_y = (height - lines_count) / 2;
-    int start_x = (width - (int)strlen(lines[0])) / 2;
-    clear();
-    attron(A_BOLD | COLOR_PAIR(1));
-    for (int i = 0; i < lines_count; i++) {
-        int x = (i == lines_count - 1) ? (width - (int)strlen(lines[i])) / 2 : start_x;
-        mvprintw(start_y + i, x, "%s", lines[i]);
-    }
-    attroff(A_BOLD | COLOR_PAIR(1));
-    refresh();
-    napms(650);
-}
+    int n = sizeof(lines) / sizeof(lines[0]);
+    int start_y = (height - n) / 2;
 
-static void update_content_lines(struct ui_state *st) {
-    st->content_lines = 0;
-    if (!st->content) {
-        return;
-    }
-    for (const char *p = st->content; *p; p++) {
-        if (*p == '\n') {
-            st->content_lines++;
+    clear();
+    for (int i = 0; i < n; i++) {
+        int x = (width - (int)strlen(lines[i])) / 2;
+        if (x < 0) x = 0;
+
+        if (i < 6) {
+            attron(A_BOLD | COLOR_PAIR(COL_TITLE));
+        } else if (i == n - 1) {
+            attron(COLOR_PAIR(COL_DIM));
+        }
+
+        mvprintw(start_y + i, x, "%s", lines[i]);
+
+        if (i < 6) {
+            attroff(A_BOLD | COLOR_PAIR(COL_TITLE));
+        } else if (i == n - 1) {
+            attroff(COLOR_PAIR(COL_DIM));
         }
     }
-    st->content_lines++;
+    refresh();
 }
 
+/* loading screen */
+static void draw_loading(int height, int width, const char *msg) {
+    clear();
+    attron(COLOR_PAIR(COL_TITLE));
+    mvprintw(height / 2, (width - (int)strlen(msg)) / 2, "%s", msg);
+    attroff(COLOR_PAIR(COL_TITLE));
+    refresh();
+}
+
+/* main entry */
 int run_tui(void) {
     struct ui_state st;
     memset(&st, 0, sizeof(st));
-    st.selected = 0;
+    st.mode = VIEW_RULES;
     st.suggest_rules = 1;
     st.show_overlaps = 1;
-    set_default_paths(&st);
+    init_paths(&st);
 
+    setlocale(LC_ALL, "");
     initscr();
     cbreak();
     noecho();
@@ -680,139 +1250,342 @@ int run_tui(void) {
     start_color();
     use_default_colors();
 
-    init_pair(1, COLOR_CYAN, -1);
-    init_pair(2, COLOR_BLACK, COLOR_CYAN);
-    init_pair(3, COLOR_BLACK, COLOR_WHITE);
-    init_pair(4, COLOR_BLACK, COLOR_YELLOW);
-    init_pair(5, COLOR_WHITE, -1);
-    init_pair(6, COLOR_BLUE, -1);
-
+    /* enable mouse support */
     mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
+    mouseinterval(0);  /* no click delay */
+
+    init_pair(COL_TITLE, COLOR_CYAN, -1);
+    init_pair(COL_BORDER, COLOR_CYAN, -1);
+    init_pair(COL_STATUS, COLOR_WHITE, COLOR_BLUE);
+    init_pair(COL_SELECT, COLOR_BLACK, COLOR_CYAN);
+    init_pair(COL_NORMAL, COLOR_WHITE, -1);
+    init_pair(COL_DIM, COLOR_BLUE, -1);
+    init_pair(COL_ACCENT, COLOR_YELLOW, -1);
+    init_pair(COL_WARN, COLOR_YELLOW, -1);
+    init_pair(COL_ERROR, COLOR_RED, -1);
 
     int height, width;
     getmaxyx(stdscr, height, width);
-    if (height >= 10 && width >= 50) {
-        draw_splash(height, width);
-    }
+
+    /* splash - wait for key */
+    draw_splash(height, width);
+    getch();
+
+    /* loading */
+    draw_loading(height, width, "Loading rules...");
+    load_rules(&st);
 
     int running = 1;
     while (running) {
         getmaxyx(stdscr, height, width);
+
         if (height < UI_MIN_HEIGHT || width < UI_MIN_WIDTH) {
             clear();
-            mvprintw(0, 0, "Resize terminal to at least %dx%d", UI_MIN_WIDTH, UI_MIN_HEIGHT);
+            mvprintw(height / 2, 0, "Resize to %dx%d", UI_MIN_WIDTH, UI_MIN_HEIGHT);
             refresh();
-            int ch = getch();
-            if (ch == 'q') {
-                break;
-            }
+            if (getch() == 'q') break;
             continue;
         }
 
-        int menu_w = 24;
-        int content_x = menu_w + 1;
-        int content_w = width - content_x - 1;
-        int content_h = height - 4;
-        int menu_h = height - 4;
-
         clear();
-        draw_title(width);
-        draw_menu(1, menu_w, menu_h, st.selected);
-        draw_content(1, content_x, content_h, content_w, &st);
-        draw_footer(height - 2, width);
-        draw_status(height, width, "Enter run • s settings • q quit");
+
+        /* header */
+        if (st.modified) {
+            draw_header(width, "hyprwindows [*]");
+        } else {
+            draw_header(width, "hyprwindows");
+        }
+
+        /* tabs */
+        draw_tabs(1, width, st.mode);
+
+        /* main content area */
+        int content_y = 2;
+        int content_h = height - 4;
+
+        switch (st.mode) {
+        case VIEW_RULES:
+            if (width > 100) {
+                /* split view: list + detail */
+                int list_w = width * 2 / 3;
+                draw_rules_view(&st, content_y, content_h, list_w);
+                draw_rule_detail(&st, content_y, list_w, content_h, width - list_w);
+            } else {
+                draw_rules_view(&st, content_y, content_h, width);
+            }
+            break;
+        case VIEW_WINDOWS:
+            draw_windows_view(&st, content_y, content_h, width);
+            break;
+        case VIEW_REVIEW:
+            draw_review_view(&st, content_y, content_h, width);
+            break;
+        case VIEW_SETTINGS:
+            draw_settings_view(&st, content_y, content_h, width);
+            break;
+        }
+
+        /* status bar - view-specific help */
+        const char *help;
+        switch (st.mode) {
+        case VIEW_RULES:
+            help = "Enter:Edit  d:Del  x:Disable  s:Save  b:Backup  q:Quit";
+            break;
+        default:
+            help = "1-4:Views  ↑↓:Nav  s:Save  b:Backup  r:Reload  q:Quit";
+            break;
+        }
+        draw_statusbar(height - 1, width, st.status, help);
+
         refresh();
 
         int ch = getch();
-        if (ch == 'q') {
-            running = 0;
-            continue;
-        }
-        if (ch == KEY_UP) {
-            if (st.selected > 0) {
-                st.selected--;
-            }
-            continue;
-        }
-        if (ch == KEY_DOWN) {
-            if (st.selected < menu_count() - 1) {
-                st.selected++;
-            }
-            continue;
-        }
-        if (ch == 's' || ch == 'S') {
-            settings_screen(&st);
-            update_content_lines(&st);
-            continue;
-        }
-        if (ch == '\n' || ch == KEY_ENTER) {
-            if (st.selected == menu_count() - 1) {
-                running = 0;
-                continue;
-            }
-            if (st.selected == 3) {
-                rule_editor_screen(&st);
-                update_content_lines(&st);
-            } else if (st.selected == 4) {
-                settings_screen(&st);
-                update_content_lines(&st);
-            } else {
-                run_action(&st, st.selected);
-            }
-            continue;
-        }
-        if (ch == KEY_NPAGE) {
-            st.scroll += 5;
-            continue;
-        }
-        if (ch == KEY_PPAGE) {
-            st.scroll -= 5;
-            if (st.scroll < 0) {
-                st.scroll = 0;
-            }
-            continue;
-        }
+
+        /* handle mouse events */
         if (ch == KEY_MOUSE) {
-            MEVENT ev;
-            if (getmouse(&ev) == OK) {
-                if (ev.y >= 1 && ev.y < 1 + menu_h && ev.x < menu_w) {
-                    int idx = ev.y - 3;
-                    if (idx >= 0 && idx < menu_count()) {
-                        st.selected = idx;
-                        if (ev.bstate & BUTTON1_CLICKED) {
-                            if (st.selected == menu_count() - 1) {
-                                running = 0;
-                            } else {
-                                if (st.selected == 3) {
-                                    rule_editor_screen(&st);
-                                    update_content_lines(&st);
-                                } else if (st.selected == 4) {
-                                    settings_screen(&st);
-                                    update_content_lines(&st);
-                                } else {
-                                    run_action(&st, st.selected);
-                                }
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                int click = event.bstate & (BUTTON1_CLICKED | BUTTON1_PRESSED | BUTTON1_RELEASED);
+                int dblclick = event.bstate & BUTTON1_DOUBLE_CLICKED;
+
+                /* double-click to edit (check FIRST, before single click) */
+                if (st.mode == VIEW_RULES && dblclick && event.y > 3) {
+                    int content_y = 2;
+                    int list_row = event.y - content_y - 2;
+                    if (list_row >= 0) {
+                        int clicked_idx = st.scroll + list_row;
+                        if (clicked_idx >= 0 && clicked_idx < (int)st.rules.count) {
+                            st.selected = clicked_idx;
+                            if (edit_rule_modal(&st.rules.rules[st.selected], height, width)) {
+                                st.modified = 1;
+                                set_status(&st, "Rule modified (not saved to file)");
                             }
                         }
                     }
                 }
-                if (ev.bstate & BUTTON4_PRESSED) {
-                    if (st.scroll > 0) {
-                        st.scroll--;
+                /* click on tabs (row 1) */
+                else if (event.y == 1 && click) {
+                    /* calculate tab positions based on actual tab strings */
+                    /* [1] Rules  [2] Windows  [3] Review  [4] Settings */
+                    if (event.x >= 2 && event.x < 14) {
+                        st.mode = VIEW_RULES; st.selected = 0; st.scroll = 0;
+                    } else if (event.x >= 15 && event.x < 29) {
+                        st.mode = VIEW_WINDOWS; st.scroll = 0;
+                    } else if (event.x >= 30 && event.x < 43) {
+                        st.mode = VIEW_REVIEW;
+                    } else if (event.x >= 44 && event.x < 60) {
+                        st.mode = VIEW_SETTINGS; st.selected = 0;
                     }
                 }
-                if (ev.bstate & BUTTON5_PRESSED) {
-                    st.scroll++;
+                /* scroll wheel */
+                else if (event.bstate & BUTTON4_PRESSED) {  /* scroll up */
+                    if (st.mode == VIEW_RULES && st.selected > 0) st.selected--;
+                    else if (st.mode == VIEW_WINDOWS && st.scroll > 0) st.scroll--;
+                }
+                else if (event.bstate & BUTTON5_PRESSED) {  /* scroll down */
+                    if (st.mode == VIEW_RULES && st.selected < (int)st.rules.count - 1) st.selected++;
+                    else if (st.mode == VIEW_WINDOWS) st.scroll++;
+                }
+                /* click in rules list */
+                else if (st.mode == VIEW_RULES && click && event.y > 3) {
+                    int content_y = 2;
+                    int list_row = event.y - content_y - 2;  /* -2 for box border and header */
+                    if (list_row >= 0 && event.x > 0 && event.x < width * 2 / 3) {
+                        int clicked_idx = st.scroll + list_row;
+                        if (clicked_idx >= 0 && clicked_idx < (int)st.rules.count) {
+                            st.selected = clicked_idx;
+                        }
+                    }
+                }
+                /* click in settings to toggle */
+                else if (st.mode == VIEW_SETTINGS && click) {
+                    int content_y = 2;
+                    int row = (event.y - content_y - 2) / 2;  /* settings rows are spaced by 2 */
+                    if (row >= 0 && row <= 4) {
+                        st.selected = row;
+                        if (row == 3) st.suggest_rules = !st.suggest_rules;
+                        if (row == 4) st.show_overlaps = !st.show_overlaps;
+                    }
                 }
             }
             continue;
         }
-        if (ch == KEY_RIGHT || ch == KEY_LEFT) {
+
+        /* global keys */
+        if (ch == 'q' || ch == 'Q') {
+            if (st.modified) {
+                /* prompt to save */
+                int choice = 0;
+                while (1) {
+                    int dh = 9, dw = 50;
+                    int dy = (height - dh) / 2;
+                    int dx = (width - dw) / 2;
+
+                    attron(COLOR_PAIR(COL_BORDER));
+                    for (int i = 0; i < dh; i++) mvhline(dy + i, dx, ' ', dw);
+                    draw_box(dy, dx, dh, dw, "Unsaved Changes");
+                    attroff(COLOR_PAIR(COL_BORDER));
+
+                    mvprintw(dy + 2, dx + 3, "You have unsaved changes.");
+                    mvprintw(dy + 3, dx + 3, "What would you like to do?");
+
+                    const char *opts[] = {"Save and quit", "Quit without saving", "Cancel"};
+                    for (int i = 0; i < 3; i++) {
+                        if (i == choice) attron(COLOR_PAIR(COL_SELECT));
+                        else attron(COLOR_PAIR(COL_DIM));
+                        mvprintw(dy + 5 + i, dx + 5, " %s ", opts[i]);
+                        if (i == choice) attroff(COLOR_PAIR(COL_SELECT));
+                        else attroff(COLOR_PAIR(COL_DIM));
+                    }
+                    refresh();
+
+                    int c = getch();
+                    if (c == KEY_UP && choice > 0) choice--;
+                    else if (c == KEY_DOWN && choice < 2) choice++;
+                    else if (c == '\n' || c == KEY_ENTER) break;
+                    else if (c == 27) { choice = 2; break; }  /* ESC = cancel */
+                    else if (c == 's' || c == 'S') { choice = 0; break; }
+                    else if (c == 'q') { choice = 1; break; }
+                }
+
+                if (choice == 0) {
+                    /* save and quit */
+                    if (!st.backup_created) create_backup(&st);
+                    if (save_rules(&st) == 0) {
+                        set_status(&st, "Saved to %s", st.rules_path);
+                    }
+                    running = 0;
+                } else if (choice == 1) {
+                    /* quit without saving */
+                    running = 0;
+                }
+                /* choice == 2: cancel, continue */
+            } else {
+                running = 0;
+            }
             continue;
+        }
+        /* save */
+        if (ch == 's' || ch == 'S') {
+            if (!st.backup_created) {
+                if (create_backup(&st) == 0) {
+                    set_status(&st, "Backup created: %s", st.backup_path);
+                }
+            }
+            if (save_rules(&st) == 0) {
+                set_status(&st, "Saved %zu rules to %s", st.rules.count, st.rules_path);
+            } else {
+                set_status(&st, "Failed to save rules");
+            }
+            continue;
+        }
+        /* backup only */
+        if (ch == 'b' || ch == 'B') {
+            if (create_backup(&st) == 0) {
+                set_status(&st, "Backup created: %s", st.backup_path);
+            } else {
+                set_status(&st, "Failed to create backup");
+            }
+            continue;
+        }
+        if (ch == '1') { st.mode = VIEW_RULES; st.selected = 0; st.scroll = 0; continue; }
+        if (ch == '2') { st.mode = VIEW_WINDOWS; st.scroll = 0; continue; }
+        if (ch == '3') { st.mode = VIEW_REVIEW; continue; }
+        if (ch == '4') { st.mode = VIEW_SETTINGS; st.selected = 0; continue; }
+        if (ch == 'r' || ch == 'R') {
+            if (st.modified) {
+                if (!confirm_dialog(height, width, "Reload", "Discard unsaved changes?")) {
+                    continue;
+                }
+            }
+            draw_loading(height, width, "Reloading...");
+            load_rules(&st);
+            continue;
+        }
+
+        /* view-specific keys */
+        switch (st.mode) {
+        case VIEW_RULES:
+            if (ch == KEY_UP && st.selected > 0) st.selected--;
+            if (ch == KEY_DOWN && st.selected < (int)st.rules.count - 1) st.selected++;
+            if (ch == KEY_PPAGE) { st.selected -= 10; if (st.selected < 0) st.selected = 0; }
+            if (ch == KEY_NPAGE) { st.selected += 10; if (st.selected >= (int)st.rules.count) st.selected = (int)st.rules.count - 1; }
+            if (ch == KEY_HOME) st.selected = 0;
+            if (ch == KEY_END) st.selected = (int)st.rules.count - 1;
+            if ((ch == '\n' || ch == KEY_ENTER) && st.selected >= 0 && st.selected < (int)st.rules.count) {
+                if (edit_rule_modal(&st.rules.rules[st.selected], height, width)) {
+                    st.modified = 1;
+                    set_status(&st, "Rule modified (not saved to file)");
+                }
+            }
+            /* delete rule */
+            if ((ch == 'd' || ch == KEY_DC) && st.selected >= 0 && st.selected < (int)st.rules.count) {
+                struct rule *r = &st.rules.rules[st.selected];
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Delete rule '%s'?", r->name ? r->name : "(unnamed)");
+                if (confirm_dialog(height, width, "Delete Rule", msg)) {
+                    /* remove from array */
+                    for (int i = st.selected; i < (int)st.rules.count - 1; i++) {
+                        st.rules.rules[i] = st.rules.rules[i + 1];
+                        if (st.rule_status) st.rule_status[i] = st.rule_status[i + 1];
+                    }
+                    st.rules.count--;
+                    if (st.selected >= (int)st.rules.count && st.selected > 0) st.selected--;
+                    st.modified = 1;
+                    set_status(&st, "Rule deleted (not saved to file)");
+                }
+            }
+            /* disable rule - move to .disabled file */
+            if (ch == 'x' && st.selected >= 0 && st.selected < (int)st.rules.count) {
+                struct rule *r = &st.rules.rules[st.selected];
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Disable rule '%s'?", r->name ? r->name : "(unnamed)");
+                if (confirm_dialog(height, width, "Disable Rule", msg)) {
+                    char disabled_path[512];
+                    char *expanded = expand_path(st.rules_path);
+                    get_disabled_path(expanded ? expanded : st.rules_path, disabled_path, sizeof(disabled_path));
+                    free(expanded);
+
+                    if (write_rule_to_file(disabled_path, r, "a") == 0) {
+                        /* remove from array */
+                        for (int i = st.selected; i < (int)st.rules.count - 1; i++) {
+                            st.rules.rules[i] = st.rules.rules[i + 1];
+                            if (st.rule_status) st.rule_status[i] = st.rule_status[i + 1];
+                        }
+                        st.rules.count--;
+                        if (st.selected >= (int)st.rules.count && st.selected > 0) st.selected--;
+                        st.modified = 1;
+                        set_status(&st, "Rule disabled -> %s", disabled_path);
+                    } else {
+                        set_status(&st, "Failed to write to %s", disabled_path);
+                    }
+                }
+            }
+            break;
+
+        case VIEW_WINDOWS:
+            if (ch == KEY_UP || ch == KEY_PPAGE) { st.scroll -= (ch == KEY_PPAGE ? 10 : 1); if (st.scroll < 0) st.scroll = 0; }
+            if (ch == KEY_DOWN || ch == KEY_NPAGE) st.scroll += (ch == KEY_NPAGE ? 10 : 1);
+            break;
+
+        case VIEW_SETTINGS:
+            if (ch == KEY_UP && st.selected > 0) st.selected--;
+            if (ch == KEY_DOWN && st.selected < 4) st.selected++;
+            if (ch == ' ' || ch == '\n') {
+                if (st.selected == 3) st.suggest_rules = !st.suggest_rules;
+                if (st.selected == 4) st.show_overlaps = !st.show_overlaps;
+            }
+            break;
+
+        default:
+            break;
         }
     }
 
     endwin();
-    free(st.content);
+    ruleset_free(&st.rules);
+    free(st.rule_status);
+    missing_rules_free(&st.missing);
+    free(st.review_text);
     return 0;
 }

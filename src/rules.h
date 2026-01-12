@@ -2,7 +2,6 @@
 #define HYPRWINDOWS_RULES_H
 
 #include <stddef.h>
-#include "json.h"
 
 struct rule_match {
     char *class_re;
@@ -24,10 +23,19 @@ struct rule_actions {
     int center_val;
 };
 
+/* key-value pair for unknown/extra fields */
+struct rule_extra {
+    char *key;
+    char *value;
+};
+
 struct rule {
     char *name;
+    char *display_name;  /* derived human-readable name */
     struct rule_match match;
     struct rule_actions actions;
+    struct rule_extra *extras;
+    size_t extras_count;
 };
 
 struct ruleset {
@@ -35,7 +43,9 @@ struct ruleset {
     size_t count;
 };
 
-int ruleset_load_json(const char *path, struct ruleset *out);
+int ruleset_load(const char *path, struct ruleset *out);
 void ruleset_free(struct ruleset *set);
+
+char *hypr_find_rules_config(void);
 
 #endif

@@ -1,18 +1,59 @@
 [
   {
     "dotfile": "qutebrowser",
+    "package": "qutebrowser",
     "classes": ["qutebrowser", "org.qutebrowser.qutebrowser"],
     "group": "browser"
   },
   {
+    "dotfile": "firefox",
+    "package": "firefox",
+    "classes": ["firefox", "Firefox", "firefox-esr", "Navigator"],
+    "group": "browser"
+  },
+  {
+    "dotfile": "chromium",
+    "package": "chromium",
+    "classes": ["chromium", "Chromium", "chromium-browser"],
+    "group": "browser"
+  },
+  {
+    "dotfile": "brave",
+    "package": "brave-bin",
+    "classes": ["brave", "Brave-browser", "brave-browser"],
+    "group": "browser"
+  },
+  {
     "dotfile": "mpv",
+    "package": "mpv",
     "classes": ["mpv"],
+    "group": "multimedia_video"
+  },
+  {
+    "dotfile": "vlc",
+    "package": "vlc",
+    "classes": ["vlc", "VLC"],
+    "group": "multimedia_video"
+  },
+  {
+    "dotfile": "obs-studio",
+    "classes": ["obs", "com.obsproject.Studio"],
     "group": "multimedia_video"
   },
   {
     "dotfile": "rofi",
     "classes": ["rofi", "Rofi"],
-    "group": "settings"
+    "group": "launcher"
+  },
+  {
+    "dotfile": "wofi",
+    "classes": ["wofi"],
+    "group": "launcher"
+  },
+  {
+    "dotfile": "fuzzel",
+    "classes": ["fuzzel"],
+    "group": "launcher"
   },
   {
     "dotfile": "ghostty",
@@ -25,8 +66,53 @@
     "group": "terminal"
   },
   {
+    "dotfile": "alacritty",
+    "classes": ["Alacritty", "alacritty"],
+    "group": "terminal"
+  },
+  {
+    "dotfile": "wezterm",
+    "classes": ["org.wezfurlong.wezterm", "wezterm"],
+    "group": "terminal"
+  },
+  {
+    "dotfile": "foot",
+    "classes": ["foot", "footclient"],
+    "group": "terminal"
+  },
+  {
+    "dotfile": "Code",
+    "classes": ["code", "Code", "code-oss", "VSCodium", "codium"],
+    "group": "editor"
+  },
+  {
+    "dotfile": "nvim",
+    "classes": ["neovide", "Neovide"],
+    "group": "editor"
+  },
+  {
+    "dotfile": "emacs",
+    "classes": ["Emacs", "emacs"],
+    "group": "editor"
+  },
+  {
+    "dotfile": "zed",
+    "classes": ["Zed", "dev.zed.Zed"],
+    "group": "editor"
+  },
+  {
     "dotfile": "swaync",
     "classes": ["swaync-control-center", "swaync-notification-window", "swaync-client"],
+    "group": "notif"
+  },
+  {
+    "dotfile": "dunst",
+    "classes": ["Dunst", "dunst"],
+    "group": "notif"
+  },
+  {
+    "dotfile": "mako",
+    "classes": ["mako"],
     "group": "notif"
   },
   {
@@ -35,24 +121,174 @@
     "group": "wallpaper"
   },
   {
+    "dotfile": "swww",
+    "classes": ["swww"],
+    "group": "wallpaper"
+  },
+  {
     "dotfile": "waybar",
-    "classes": ["waybar"],
-    "group": "settings"
+    "classes": ["waybar", "Waybar"],
+    "group": "bar"
+  },
+  {
+    "dotfile": "eww",
+    "classes": ["eww", "Eww"],
+    "group": "bar"
   },
   {
     "dotfile": "wlogout",
     "classes": ["wlogout"],
-    "group": "settings"
+    "group": "session"
   },
   {
     "dotfile": "pavucontrol.ini",
     "classes": ["pavucontrol", "org.pulseaudio.pavucontrol", "com.saivert.pwvucontrol"],
-    "group": "settings"
+    "group": "audio"
+  },
+  {
+    "dotfile": "spotify",
+    "classes": ["Spotify", "spotify"],
+    "group": "multimedia_audio"
+  },
+  {
+    "dotfile": "cmus",
+    "classes": ["cmus"],
+    "group": "multimedia_audio"
+  },
+  {
+    "dotfile": "ncmpcpp",
+    "classes": ["ncmpcpp"],
+    "group": "multimedia_audio"
+  },
+  {
+    "dotfile": "discord",
+    "classes": ["discord", "Discord", "vesktop", "WebCord"],
+    "group": "communication"
+  },
+  {
+    "dotfile": "slack",
+    "classes": ["Slack", "slack"],
+    "group": "communication"
+  },
+  {
+    "dotfile": "signal",
+    "classes": ["Signal", "signal"],
+    "group": "communication"
+  },
+  {
+    "dotfile": "element",
+    "classes": ["Element", "element"],
+    "group": "communication"
+  },
+  {
+    "dotfile": "telegram",
+    "classes": ["telegram-desktop", "TelegramDesktop", "org.telegram.desktop"],
+    "group": "communication"
+  },
+  {
+    "dotfile": "thunderbird",
+    "classes": ["thunderbird", "Thunderbird", "Mail"],
+    "group": "mail"
+  },
+  {
+    "dotfile": "neomutt",
+    "classes": ["neomutt"],
+    "group": "mail"
   },
   {
     "dotfile": "qalculate",
     "classes": ["qalculate-gtk", "Qalculate-gtk"],
-    "group": "settings"
+    "group": "utility"
+  },
+  {
+    "dotfile": "thunar",
+    "classes": ["thunar", "Thunar"],
+    "group": "filemanager"
+  },
+  {
+    "dotfile": "pcmanfm",
+    "classes": ["pcmanfm", "Pcmanfm"],
+    "group": "filemanager"
+  },
+  {
+    "dotfile": "nautilus",
+    "classes": ["nautilus", "org.gnome.Nautilus"],
+    "group": "filemanager"
+  },
+  {
+    "dotfile": "dolphin",
+    "classes": ["dolphin", "org.kde.dolphin"],
+    "group": "filemanager"
+  },
+  {
+    "dotfile": "yazi",
+    "classes": ["yazi"],
+    "group": "filemanager"
+  },
+  {
+    "dotfile": "lf",
+    "classes": ["lf"],
+    "group": "filemanager"
+  },
+  {
+    "dotfile": "ranger",
+    "classes": ["ranger"],
+    "group": "filemanager"
+  },
+  {
+    "dotfile": "gimp",
+    "classes": ["Gimp", "gimp", "Gimp-2.10"],
+    "group": "graphics"
+  },
+  {
+    "dotfile": "inkscape",
+    "classes": ["Inkscape", "org.inkscape.Inkscape"],
+    "group": "graphics"
+  },
+  {
+    "dotfile": "krita",
+    "classes": ["krita", "org.kde.krita"],
+    "group": "graphics"
+  },
+  {
+    "dotfile": "blender",
+    "classes": ["Blender", "blender"],
+    "group": "graphics"
+  },
+  {
+    "dotfile": "imv",
+    "classes": ["imv", "imv-wayland"],
+    "group": "image_viewer"
+  },
+  {
+    "dotfile": "swayimg",
+    "classes": ["swayimg"],
+    "group": "image_viewer"
+  },
+  {
+    "dotfile": "feh",
+    "classes": ["feh"],
+    "group": "image_viewer"
+  },
+  {
+    "dotfile": "zathura",
+    "classes": ["Zathura", "zathura", "org.pwmt.zathura"],
+    "group": "document"
+  },
+  {
+    "dotfile": "evince",
+    "classes": ["Evince", "evince", "org.gnome.Evince"],
+    "group": "document"
+  },
+  {
+    "dotfile": "okular",
+    "classes": ["okular", "org.kde.okular"],
+    "group": "document"
+  },
+  {
+    "dotfile": "libreoffice",
+    "classes": ["libreoffice", "libreoffice-writer", "libreoffice-calc", "libreoffice-impress", "soffice"],
+    "group": "office"
   },
   {
     "dotfile": "qt5ct",
@@ -63,5 +299,80 @@
     "dotfile": "qt6ct",
     "classes": ["qt6ct"],
     "group": "settings"
+  },
+  {
+    "dotfile": "nwg-look",
+    "classes": ["nwg-look"],
+    "group": "settings"
+  },
+  {
+    "dotfile": "lxappearance",
+    "classes": ["Lxappearance", "lxappearance"],
+    "group": "settings"
+  },
+  {
+    "dotfile": "nm-applet",
+    "classes": ["nm-applet", "nm-connection-editor"],
+    "group": "settings"
+  },
+  {
+    "dotfile": "blueman",
+    "classes": ["blueman-manager", "Blueman-manager", "blueman-applet"],
+    "group": "settings"
+  },
+  {
+    "dotfile": "steam",
+    "classes": ["Steam", "steam", "steamwebhelper"],
+    "group": "gaming"
+  },
+  {
+    "dotfile": "lutris",
+    "classes": ["Lutris", "lutris"],
+    "group": "gaming"
+  },
+  {
+    "dotfile": "bottles",
+    "classes": ["bottles", "com.usebottles.bottles"],
+    "group": "gaming"
+  },
+  {
+    "dotfile": "bitwarden",
+    "classes": ["Bitwarden", "bitwarden"],
+    "group": "security"
+  },
+  {
+    "dotfile": "keepassxc",
+    "classes": ["KeePassXC", "keepassxc", "org.keepassxc.KeePassXC"],
+    "group": "security"
+  },
+  {
+    "dotfile": "1password",
+    "classes": ["1Password", "1password"],
+    "group": "security"
+  },
+  {
+    "dotfile": "transmission",
+    "classes": ["transmission-gtk", "Transmission-gtk", "transmission-qt"],
+    "group": "torrent"
+  },
+  {
+    "dotfile": "qbittorrent",
+    "classes": ["qbittorrent", "qBittorrent"],
+    "group": "torrent"
+  },
+  {
+    "dotfile": "newsboat",
+    "classes": ["newsboat"],
+    "group": "rss"
+  },
+  {
+    "dotfile": "virt-manager",
+    "classes": ["virt-manager", "Virt-manager"],
+    "group": "virtualization"
+  },
+  {
+    "dotfile": "gnome-boxes",
+    "classes": ["gnome-boxes", "org.gnome.Boxes"],
+    "group": "virtualization"
   }
 ]

@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <unistd.h>
 
 #include "appmap.h"
 #include "hyprctl.h"
@@ -156,7 +158,7 @@ int outbuf_printf(struct outbuf *out, const char *fmt, ...) {
 
 int summarize_rules_text(const char *path, struct outbuf *out) {
     struct ruleset rules;
-    if (ruleset_load_json(path, &rules) != 0) {
+    if (ruleset_load(path, &rules) != 0) {
         outbuf_printf(out, "Failed to load rules from %s\n", path);
         return -1;
     }
@@ -210,7 +212,7 @@ static int dotfiles_has_entry(const char *dotfiles, const char *entry) {
 int scan_dotfiles_text(const char *dotfiles, const char *rules_path, const char *appmap_path,
                        const struct action_opts *opts, struct outbuf *out) {
     struct ruleset rules;
-    if (ruleset_load_json(rules_path, &rules) != 0) {
+    if (ruleset_load(rules_path, &rules) != 0) {
         outbuf_printf(out, "Failed to load rules from %s\n", rules_path);
         return -1;
     }
@@ -333,7 +335,7 @@ static char *slugify(const char *s) {
     return out;
 }
 
-static int rule_matches_client(const struct rule *r, const struct client *c) {
+int rule_matches_client(const struct rule *r, const struct client *c) {
     if (r->match.class_re) {
         if (!c->class_name || !regex_match(r->match.class_re, c->class_name)) {
             return 0;
@@ -362,7 +364,7 @@ static int rule_matches_client(const struct rule *r, const struct client *c) {
 
 int active_windows_text(const char *rules_path, const struct action_opts *opts, struct outbuf *out) {
     struct ruleset rules;
-    if (ruleset_load_json(rules_path, &rules) != 0) {
+    if (ruleset_load(rules_path, &rules) != 0) {
         outbuf_printf(out, "Failed to load rules from %s\n", rules_path);
         return -1;
     }
@@ -403,13 +405,11 @@ int active_windows_text(const char *rules_path, const struct action_opts *opts, 
                 char *regex = escape_regex(c->class_name);
                 char *slug = slugify(c->class_name);
                 outbuf_printf(out, "  Suggestion:\n");
-                outbuf_printf(out, "    {\n");
-                outbuf_printf(out, "      \"name\": \"rule-auto-%s\",\n", slug ? slug : "window");
-                outbuf_printf(out, "      \"match:class\": \"%s\"", regex ? regex : "^<class>$");
+                outbuf_printf(out, "    windowrule {\n");
+                outbuf_printf(out, "      name = rule-auto-%s\n", slug ? slug : "window");
+                outbuf_printf(out, "      match:class = %s\n", regex ? regex : "^<class>$");
                 if (c->workspace_id >= 0) {
-                    outbuf_printf(out, ",\n      \"workspace\": \"%d\"\n", c->workspace_id);
-                } else {
-                    outbuf_printf(out, "\n");
+                    outbuf_printf(out, "      workspace = %d\n", c->workspace_id);
                 }
                 outbuf_printf(out, "    }\n");
                 free(regex);
@@ -431,6 +431,204 @@ int active_windows_text(const char *rules_path, const struct action_opts *opts, 
     }
 
     clients_free(&clients);
+    ruleset_free(&rules);
+    return 0;
+}
+
+int review_rules_text(const char *rules_path, struct outbuf *out) {
+    struct ruleset rules;
+    if (ruleset_load(rules_path, &rules) != 0) {
+        outbuf_printf(out, "Failed to load rules from %s\n", rules_path);
+        return -1;
+    }
+    struct clients clients;
+    if (hyprctl_clients(&clients) != 0) {
+        outbuf_printf(out, "Failed to read hyprctl clients\n");
+        ruleset_free(&rules);
+        return -1;
+    }
+
+    /* track which rules matched at least one window */
+    int *matched = calloc(rules.count, sizeof(int));
+    if (!matched) {
+        clients_free(&clients);
+        ruleset_free(&rules);
+        return -1;
+    }
+
+    int windows_without_rules = 0;
+    for (size_t i = 0; i < clients.count; i++) {
+        struct client *c = &clients.items[i];
+        int has_match = 0;
+        for (size_t r = 0; r < rules.count; r++) {
+            if (rule_matches_client(&rules.rules[r], c)) {
+                matched[r] = 1;
+                has_match = 1;
+            }
+        }
+        if (!has_match) windows_without_rules++;
+    }
+
+    /* report unmatched rules */
+    int unused_count = 0;
+    outbuf_printf(out, "=== Rules Review ===\n\n");
+    outbuf_printf(out, "Potentially unused rules (no matching windows):\n");
+    for (size_t r = 0; r < rules.count; r++) {
+        if (!matched[r]) {
+            struct rule *rule = &rules.rules[r];
+            const char *name = rule->name ? rule->name : "(unnamed)";
+            const char *class_re = rule->match.class_re ? rule->match.class_re : "-";
+            outbuf_printf(out, "  %s: %s\n", name, class_re);
+            unused_count++;
+        }
+    }
+    if (unused_count == 0) {
+        outbuf_printf(out, "  (none - all rules match at least one window)\n");
+    }
+
+    outbuf_printf(out, "\nSummary:\n");
+    outbuf_printf(out, "  Total rules: %zu\n", rules.count);
+    outbuf_printf(out, "  Active rules: %zu\n", rules.count - unused_count);
+    outbuf_printf(out, "  Unused rules: %d\n", unused_count);
+    outbuf_printf(out, "  Windows without rules: %d\n", windows_without_rules);
+
+    free(matched);
+    clients_free(&clients);
+    ruleset_free(&rules);
+    return 0;
+}
+
+/* check if any rule matches a class pattern (simple substring check) */
+static int rules_cover_class(const struct ruleset *rules, const char *class_name) {
+    for (size_t i = 0; i < rules->count; i++) {
+        const char *re = rules->rules[i].match.class_re;
+        if (!re) continue;
+        /* simple check: class name appears in regex */
+        if (strcasestr(re, class_name)) return 1;
+    }
+    return 0;
+}
+
+/* check if package is installed via pacman/yay */
+static int package_installed(const char *pkg) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "pacman -Qi %s >/dev/null 2>&1", pkg);
+    return system(cmd) == 0;
+}
+
+/* check if dotfile config exists */
+static int dotfile_exists(const char *dotfiles_path, const char *name) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dotfiles_path, name);
+    return access(path, F_OK) == 0;
+}
+
+/* build class regex from appmap entry */
+static char *build_class_regex(const struct appmap_entry *e) {
+    if (!e || e->class_count == 0) return NULL;
+    
+    size_t len = 4; /* ^()$ */
+    for (size_t i = 0; i < e->class_count; i++) {
+        len += strlen(e->classes[i]) + 1; /* +1 for | */
+    }
+    
+    char *re = malloc(len + 1);
+    if (!re) return NULL;
+    
+    strcpy(re, "^(");
+    for (size_t i = 0; i < e->class_count; i++) {
+        if (i > 0) strcat(re, "|");
+        strcat(re, e->classes[i]);
+    }
+    strcat(re, ")$");
+    return re;
+}
+
+void missing_rules_free(struct missing_rules *mr) {
+    if (!mr) return;
+    for (size_t i = 0; i < mr->count; i++) {
+        free(mr->items[i].app_name);
+        free(mr->items[i].class_pattern);
+        free(mr->items[i].group);
+        free(mr->items[i].source);
+    }
+    free(mr->items);
+    mr->items = NULL;
+    mr->count = 0;
+}
+
+int find_missing_rules(const char *rules_path, const char *appmap_path,
+                       const char *dotfiles_path, struct missing_rules *out) {
+    memset(out, 0, sizeof(*out));
+    
+    struct ruleset rules;
+    if (ruleset_load(rules_path, &rules) != 0) {
+        return -1;
+    }
+    
+    struct appmap appmap;
+    if (appmap_load(appmap_path, &appmap) != 0) {
+        ruleset_free(&rules);
+        return -1;
+    }
+    
+    /* expand dotfiles path */
+    char *dotfiles_exp = NULL;
+    if (dotfiles_path && dotfiles_path[0] == '~') {
+        const char *home = getenv("HOME");
+        if (home) {
+            dotfiles_exp = malloc(strlen(home) + strlen(dotfiles_path));
+            if (dotfiles_exp) {
+                sprintf(dotfiles_exp, "%s%s", home, dotfiles_path + 1);
+            }
+        }
+    }
+    const char *dotfiles = dotfiles_exp ? dotfiles_exp : dotfiles_path;
+    
+    /* check each appmap entry */
+    size_t cap = 0;
+    for (size_t i = 0; i < appmap.count; i++) {
+        struct appmap_entry *e = &appmap.entries[i];
+        if (e->class_count == 0) continue;
+        
+        /* check if any class is already covered by rules */
+        int covered = 0;
+        for (size_t j = 0; j < e->class_count && !covered; j++) {
+            if (rules_cover_class(&rules, e->classes[j])) {
+                covered = 1;
+            }
+        }
+        if (covered) continue;
+        
+        /* check if app is installed (package or dotfile) */
+        const char *source = NULL;
+        const char *pkg = e->package ? e->package : e->dotfile;
+        
+        if (pkg && package_installed(pkg)) {
+            source = "package";
+        } else if (e->dotfile && dotfiles && dotfile_exists(dotfiles, e->dotfile)) {
+            source = "dotfile";
+        }
+        
+        if (!source) continue;
+        
+        /* add to missing list */
+        if (out->count >= cap) {
+            cap = cap ? cap * 2 : 8;
+            struct missing_rule *new_items = realloc(out->items, cap * sizeof(struct missing_rule));
+            if (!new_items) continue;
+            out->items = new_items;
+        }
+        
+        struct missing_rule *mr = &out->items[out->count++];
+        mr->app_name = strdup(e->dotfile ? e->dotfile : pkg);
+        mr->class_pattern = build_class_regex(e);
+        mr->group = e->group ? strdup(e->group) : NULL;
+        mr->source = strdup(source);
+    }
+    
+    free(dotfiles_exp);
+    appmap_free(&appmap);
     ruleset_free(&rules);
     return 0;
 }

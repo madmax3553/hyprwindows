@@ -1,0 +1,68 @@
+.TH HYPRWINDOWS 1 "January 2026" "hyprwindows" "User Commands"
+.SH NAME
+hyprwindows \- Hyprland window rules manager
+.SH SYNOPSIS
+.B hyprwindows
+.RI [ options ]
+.RI [ command ]
+.RI [ args ]
+.SH DESCRIPTION
+.B hyprwindows
+is a TUI and CLI tool for managing Hyprland window rules defined in JSON/JSONC format.
+.SH COMMANDS
+.TP
+.B (none)
+Launch the interactive TUI.
+.TP
+.B \-\-tui
+Explicitly launch the TUI.
+.TP
+.BI summarize " rules.json"
+Display rules grouped by tag.
+.TP
+.BI scan-dotfiles " dotfiles_dir rules.json" " [appmap.json]"
+Scan dotfiles directory and report apps missing window rules.
+.TP
+.BI active " rules.json"
+Show active windows and which rules match them.
+.TP
+.B \-\-help
+Show usage information.
+.SH TUI CONTROLS
+.TP
+.B Up/Down
+Navigate menu
+.TP
+.B Enter
+Execute selected action
+.TP
+.B PgUp/PgDn
+Scroll output
+.TP
+.B s
+Open settings
+.TP
+.B q
+Quit
+.SH FILES
+.TP
+.I ~/.config/hypr/windowrules.jsonc
+Default rules file location (configurable in TUI settings).
+.TP
+.I data/appmap.json
+Application to window class mapping.
+.SH EXAMPLES
+.TP
+Summarize rules:
+.B hyprwindows summarize ~/.config/hypr/windowrules.jsonc
+.TP
+Find missing rules:
+.B hyprwindows scan-dotfiles ~/dotfiles ~/.config/hypr/windowrules.jsonc
+.TP
+Check active windows:
+.B hyprwindows active ~/.config/hypr/windowrules.jsonc
+.SH SEE ALSO
+.BR hyprctl (1),
+.BR hyprland (1)
+.SH AUTHOR
+hyprwindows contributors
