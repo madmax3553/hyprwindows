@@ -16,6 +16,7 @@
 #include "cascade.h"
 #include "analysis.h"
 #include "history.h"
+#include "export_rules.h"
 
 #define UI_MIN_WIDTH 80
 #define UI_MIN_HEIGHT 24
@@ -63,6 +64,17 @@ struct ui_state {
     /* options */
     int suggest_rules;
     int show_overlaps;
+
+    /* analysis and cascade caching */
+    struct analysis_report *analysis_report;
+    int analysis_loaded;
+    struct cascade_analysis **cascade_cache;  /* array of cascade analysis per window */
+    size_t cascade_count;
+    int cascade_loaded;
+
+    /* undo/redo history */
+    struct history_stack history;
+    enum grouping_mode grouping;
 
     /* status message */
     char status[256];
@@ -225,11 +237,31 @@ static void load_review_data(struct ui_state *st) {
     st->review_loaded = 1;
 }
 
+/* Load and cache analysis report */
+static void load_analysis_data(struct ui_state *st) {
+    if (st->analysis_report) {
+        analysis_free(st->analysis_report);
+        st->analysis_report = NULL;
+    }
+    st->analysis_loaded = 0;
+    
+    /* Run analysis on current ruleset */
+    st->analysis_report = analysis_run(&st->rules, NULL);
+    st->analysis_loaded = 1;
+}
+
 static void load_rules(struct ui_state *st) {
     ruleset_free(&st->rules);
     free(st->rule_status);
     st->rule_status = NULL;
     st->review_loaded = 0;  /* invalidate review cache */
+    st->analysis_loaded = 0;  /* invalidate analysis cache */
+    
+    /* free old analysis */
+    if (st->analysis_report) {
+        analysis_free(st->analysis_report);
+        st->analysis_report = NULL;
+    }
 
     char *path = expand_path(st->rules_path);
     if (ruleset_load(path ? path : st->rules_path, &st->rules) == 0) {
@@ -408,6 +440,28 @@ static const char *clean_tag(const char *tag) {
     return tag;
 }
 
+/* helper to free a rule's allocated strings */
+static void cleanup_rule(struct rule *r) {
+    if (!r) return;
+    free(r->name);
+    free(r->display_name);
+    free(r->match.class_re);
+    free(r->match.title_re);
+    free(r->match.initial_class_re);
+    free(r->match.initial_title_re);
+    free(r->match.tag_re);
+    free(r->actions.tag);
+    free(r->actions.workspace);
+    free(r->actions.opacity);
+    free(r->actions.size);
+    free(r->actions.move);
+    for (size_t i = 0; i < r->extras_count; i++) {
+        free(r->extras[i].key);
+        free(r->extras[i].value);
+    }
+    free(r->extras);
+}
+
 /* rule list view */
 static void draw_rules_view(struct ui_state *st, int y, int h, int w) {
     draw_box(y, 0, h, w, "Window Rules");
@@ -428,25 +482,32 @@ static void draw_rules_view(struct ui_state *st, int y, int h, int w) {
     if (st->selected < st->scroll) st->scroll = st->selected;
     if (st->selected >= st->scroll + visible) st->scroll = st->selected - visible + 1;
 
-    /* column header */
-    attron(COLOR_PAIR(COL_DIM));
-    mvprintw(y + 1, 3, "%-16s %-12s %-6s %-8s %s", "Application", "Tag", "WS", "Status", "Options");
-    attroff(COLOR_PAIR(COL_DIM));
+     /* column header with grouping info */
+     attron(COLOR_PAIR(COL_DIM));
+     const char *group_label = "";
+     switch (st->grouping) {
+     case GROUP_BY_WORKSPACE: group_label = "[Grouped by Workspace]"; break;
+     case GROUP_BY_TAG: group_label = "[Grouped by Tag]"; break;
+     case GROUP_BY_FLOAT: group_label = "[Grouped by Float]"; break;
+     default: group_label = "[Ungrouped]"; break;
+     }
+     mvprintw(y + 1, 3, "%-16s %-12s %-6s %-8s %s %s", "Application", "Tag", "WS", "Status", "Options", group_label);
+     attroff(COLOR_PAIR(COL_DIM));
 
-    const char *last_tag = NULL;
+     const char *last_tag = NULL;
 
-    for (int i = 0; i < visible && (st->scroll + i) < (int)st->rules.count; i++) {
-        int idx = st->scroll + i;
-        struct rule *r = &st->rules.rules[idx];
-        int row = y + 2 + i;
+     for (int i = 0; i < visible && (st->scroll + i) < (int)st->rules.count; i++) {
+         int idx = st->scroll + i;
+         struct rule *r = &st->rules.rules[idx];
+         int row = y + 2 + i;
 
-        /* get status */
-        enum rule_status status = st->rule_status ? st->rule_status[idx] : RULE_OK;
+         /* get status */
+         enum rule_status status = st->rule_status ? st->rule_status[idx] : RULE_OK;
 
-        /* use pre-computed display name */
-        const char *display = r->display_name ? r->display_name : "(unnamed)";
-        const char *tag = clean_tag(r->actions.tag);
-        const char *ws = r->actions.workspace ? r->actions.workspace : "-";
+         /* use pre-computed display name */
+         const char *display = r->display_name ? r->display_name : "(unnamed)";
+         const char *tag = clean_tag(r->actions.tag);
+         const char *ws = r->actions.workspace ? r->actions.workspace : "-";
 
         /* build options string - include extras count if any */
         char opts[32] = "";
@@ -636,52 +697,82 @@ static void draw_rule_detail(struct ui_state *st, int y, int x, int h, int w) {
 static void draw_windows_view(struct ui_state *st, int y, int h, int w) {
     draw_box(y, 0, h, w, "Active Windows");
 
-    struct outbuf out;
-    struct action_opts opts = {st->suggest_rules, st->show_overlaps};
-    outbuf_init(&out);
+    /* get active clients */
+    struct clients clients;
+    memset(&clients, 0, sizeof(clients));
+    if (hyprctl_clients(&clients) != 0) {
+        attron(COLOR_PAIR(COL_DIM));
+        mvprintw(y + h / 2, (w - 24) / 2, "Failed to read windows");
+        attroff(COLOR_PAIR(COL_DIM));
+        return;
+    }
 
-    char *path = expand_path(st->rules_path);
-    active_windows_text(path ? path : st->rules_path, &opts, &out);
-    free(path);
-
-    if (!out.data) {
+    if (clients.count == 0) {
         attron(COLOR_PAIR(COL_DIM));
         mvprintw(y + h / 2, (w - 24) / 2, "No windows found");
         attroff(COLOR_PAIR(COL_DIM));
-        outbuf_free(&out);
+        clients_free(&clients);
         return;
     }
 
     /* render output */
     int row = y + 1;
     int max_row = y + h - 1;
-    const char *p = out.data;
-    int line = 0;
 
-    while (*p && row < max_row) {
-        if (line >= st->scroll) {
-            const char *end = strchr(p, '\n');
-            int len = end ? (int)(end - p) : (int)strlen(p);
-
-            if (strncmp(p, "Window:", 7) == 0) {
-                attron(A_BOLD | COLOR_PAIR(COL_ACCENT));
-            }
-            mvprintw(row, 2, "%.*s", w - 4, p);
-            if (strncmp(p, "Window:", 7) == 0) {
-                attroff(A_BOLD | COLOR_PAIR(COL_ACCENT));
-            }
-            row++;
-
-            p += len;
-            if (*p == '\n') p++;
-        } else {
-            const char *end = strchr(p, '\n');
-            p = end ? end + 1 : p + strlen(p);
+    for (size_t i = 0; i < clients.count && row < max_row - 2; i++) {
+        struct client *c = &clients.items[i];
+        
+        /* window header */
+        attron(A_BOLD | COLOR_PAIR(COL_ACCENT));
+        mvprintw(row++, 2, "Window: %s", c->class_name ? c->class_name : "<unknown>");
+        attroff(A_BOLD | COLOR_PAIR(COL_ACCENT));
+        
+        if (row >= max_row - 2) break;
+        
+        /* window details */
+        if (c->title) {
+            mvprintw(row++, 4, "Title: %.40s", c->title);
         }
-        line++;
+        if (row >= max_row - 2) break;
+        
+        if (c->workspace_id >= 0) {
+            mvprintw(row++, 4, "Workspace: %d", c->workspace_id);
+        } else if (c->workspace_name) {
+            mvprintw(row++, 4, "Workspace: %s", c->workspace_name);
+        }
+        if (row >= max_row - 2) break;
+        
+        /* cascade analysis */
+        struct cascade_analysis *cascade = cascade_analyze(&st->rules, c);
+        if (cascade) {
+            if (cascade->step_count == 0) {
+                attron(COLOR_PAIR(COL_DIM));
+                mvprintw(row++, 4, "Matches: (none)");
+                attroff(COLOR_PAIR(COL_DIM));
+            } else {
+                attron(A_BOLD | COLOR_PAIR(COL_WARN));
+                mvprintw(row++, 4, "Cascade Analysis:");
+                attroff(A_BOLD | COLOR_PAIR(COL_WARN));
+                
+                for (size_t j = 0; j < cascade->step_count && row < max_row - 2; j++) {
+                    struct cascade_step *step = &cascade->steps[j];
+                    
+                    if (j < st->rules.count) {
+                        const char *rule_name = st->rules.rules[step->rule_index].name;
+                        mvprintw(row++, 6, "[%d] %s", step->rule_index,
+                                 rule_name ? rule_name : "<unnamed>");
+                    }
+                }
+            }
+            cascade_free(cascade);
+        }
+        
+        if (row < max_row - 1) {
+            row++;  /* spacing between windows */
+        }
     }
 
-    outbuf_free(&out);
+    clients_free(&clients);
 }
 
 /* settings view */
@@ -729,7 +820,12 @@ static void draw_review_view(struct ui_state *st, int y, int h, int w) {
         load_review_data(st);
     }
 
-    if (!st->review_text && st->missing.count == 0) {
+    /* load analysis if not cached */
+    if (!st->analysis_loaded) {
+        load_analysis_data(st);
+    }
+
+    if (!st->review_text && st->missing.count == 0 && (!st->analysis_report || st->analysis_report->count == 0)) {
         attron(COLOR_PAIR(COL_DIM));
         mvprintw(y + h / 2, (w - 20) / 2, "Review unavailable");
         attroff(COLOR_PAIR(COL_DIM));
@@ -739,6 +835,64 @@ static void draw_review_view(struct ui_state *st, int y, int h, int w) {
     /* render output */
     int row = y + 1;
     int max_row = y + h - 1;
+
+    /* show analysis results first */
+    if (st->analysis_report && st->analysis_report->count > 0) {
+        attron(A_BOLD | COLOR_PAIR(COL_ACCENT));
+        mvprintw(row++, 2, "=== Conflict Analysis ===");
+        attroff(A_BOLD | COLOR_PAIR(COL_ACCENT));
+        
+        if (st->analysis_report->errors > 0) {
+            attron(A_BOLD | COLOR_PAIR(COL_ERROR));
+            mvprintw(row++, 2, "Errors: %zu", st->analysis_report->errors);
+            attroff(A_BOLD | COLOR_PAIR(COL_ERROR));
+        }
+        if (st->analysis_report->warnings > 0) {
+            attron(A_BOLD | COLOR_PAIR(COL_WARN));
+            mvprintw(row++, 2, "Warnings: %zu", st->analysis_report->warnings);
+            attroff(A_BOLD | COLOR_PAIR(COL_WARN));
+        }
+        if (st->analysis_report->infos > 0) {
+            attron(A_BOLD | COLOR_PAIR(COL_DIM));
+            mvprintw(row++, 2, "Info: %zu", st->analysis_report->infos);
+            attroff(A_BOLD | COLOR_PAIR(COL_DIM));
+        }
+        
+        row++;
+        
+        /* show each issue */
+        for (size_t i = 0; i < st->analysis_report->count && row < max_row - 5; i++) {
+            struct rule_issue *issue = &st->analysis_report->issues[i];
+            
+            /* color by severity */
+            int color = COL_WARN;
+            if (issue->severity == SEVERITY_ERROR) color = COL_ERROR;
+            else if (issue->severity == SEVERITY_INFO) color = COL_DIM;
+            
+            attron(COLOR_PAIR(color));
+            mvprintw(row++, 4, "[%s] %s", 
+                     analysis_severity_string(issue->severity),
+                     issue->description);
+            attroff(COLOR_PAIR(color));
+            
+            /* show affected rule indices */
+            if (issue->affected_count > 0) {
+                char rule_str[128] = "";
+                for (size_t j = 0; j < issue->affected_count && j < 5; j++) {
+                    snprintf(rule_str + strlen(rule_str), sizeof(rule_str) - strlen(rule_str),
+                             "%d%s", issue->affected_rules[j], j < issue->affected_count - 1 ? ", " : "");
+                }
+                attron(COLOR_PAIR(COL_DIM));
+                mvprintw(row++, 6, "Rules: %s", rule_str);
+                attroff(COLOR_PAIR(COL_DIM));
+            }
+            
+            if (issue->suggestion[0]) {
+                mvprintw(row++, 6, "Suggestion: %.40s", issue->suggestion);
+            }
+            row++;
+        }
+    }
 
     if (st->review_text) {
         const char *p = st->review_text;
@@ -972,7 +1126,7 @@ static void get_disabled_path(const char *rules_path, char *out, size_t out_sz) 
 }
 
 /* rule edit modal - returns 1 if rule was modified */
-static int edit_rule_modal(struct rule *r, int scr_h, int scr_w) {
+static int edit_rule_modal(struct rule *r, int rule_index, struct history_stack *history, int scr_h, int scr_w) {
     /* adjust height based on extras */
     int base_h = 20;  /* increased for name field + derived preview */
     int extras_h = r->extras_count > 0 ? (int)r->extras_count + 2 : 0;
@@ -1188,6 +1342,9 @@ static int edit_rule_modal(struct rule *r, int scr_h, int scr_w) {
             else if (field == F_CENTER) { center_val = !center_val; }
         }
         else if (ch == 's' || ch == 'S') {
+            /* record change in history before modifying */
+            struct rule old_state = *r;  /* copy for history */
+            
             /* save changes to rule */
             free(r->name); r->name = name_buf[0] ? strdup(name_buf) : NULL;
             free(r->match.class_re); r->match.class_re = class_buf[0] ? strdup(class_buf) : NULL;
@@ -1199,6 +1356,12 @@ static int edit_rule_modal(struct rule *r, int scr_h, int scr_w) {
             r->actions.float_set = 1; r->actions.float_val = float_val;
             r->actions.center_set = 1; r->actions.center_val = center_val;
             update_display_name(r);  /* update derived display name */
+            
+            /* record in history */
+            char desc[128];
+            snprintf(desc, sizeof(desc), "Edit rule %d", rule_index);
+            history_record(history, CHANGE_EDIT, rule_index, &old_state, r, desc);
+            
             curs_set(0);
             return 1;
         }
@@ -1444,10 +1607,10 @@ static void draw_ui(ui_state_machine_t *sm) {
     const char *help;
     switch (sm->current_state) {
     case VIEW_RULES:
-        help = "Enter:Edit  d:Del  x:Disable  s:Save  b:Backup  q:Quit";
+        help = "Enter:Edit  d:Del  x:Disable  /:Search  g:Group  ^S:Save  ^Z/Y:Undo  q:Quit";
         break;
     default:
-        help = "1-4:Views  ↑↓:Nav  s:Save  b:Backup  r:Reload  q:Quit";
+        help = "1-4:Views  ↑↓:Nav  ^S:Save  ^Z/Y:Undo  r:Reload  q:Quit";
         break;
     }
     draw_statusbar(height - 1, width, st->status, help);
@@ -1582,29 +1745,53 @@ static void handle_rules_input(ui_state_machine_t *sm, int ch) {
         }
         search_free(&search);
     }
+    /* cycle grouping mode with 'g' key */
+    else if (ch == 'g' || ch == 'G') {
+        st->grouping = (st->grouping + 1) % 4;
+        switch (st->grouping) {
+        case GROUP_BY_WORKSPACE:
+            set_status(st, "Grouped by Workspace");
+            break;
+        case GROUP_BY_TAG:
+            set_status(st, "Grouped by Tag");
+            break;
+        case GROUP_BY_FLOAT:
+            set_status(st, "Grouped by Float");
+            break;
+        case GROUP_UNGROUPED:
+            set_status(st, "Ungrouped");
+            break;
+        }
+    }
     else if ((ch == '\n' || ch == KEY_ENTER) && st->selected >= 0 && st->selected < (int)st->rules.count) {
-        if (edit_rule_modal(&st->rules.rules[st->selected], height, width)) {
+        if (edit_rule_modal(&st->rules.rules[st->selected], st->selected, &st->history, height, width)) {
             st->modified = 1;
             set_status(st, "Rule modified (not saved to file)");
         }
     }
-    /* delete rule */
-    else if ((ch == 'd' || ch == KEY_DC) && st->selected >= 0 && st->selected < (int)st->rules.count) {
-        struct rule *r = &st->rules.rules[st->selected];
-        char msg[64];
-        snprintf(msg, sizeof(msg), "Delete rule '%s'?", r->name ? r->name : "(unnamed)");
-        if (confirm_dialog(height, width, "Delete Rule", msg)) {
-            /* remove from array */
-            for (int i = st->selected; i < (int)st->rules.count - 1; i++) {
-                st->rules.rules[i] = st->rules.rules[i + 1];
-                if (st->rule_status) st->rule_status[i] = st->rule_status[i + 1];
-            }
-            st->rules.count--;
-            if (st->selected >= (int)st->rules.count && st->selected > 0) st->selected--;
-            st->modified = 1;
-            set_status(st, "Rule deleted (not saved to file)");
-        }
-    }
+     /* delete rule */
+     else if ((ch == 'd' || ch == KEY_DC) && st->selected >= 0 && st->selected < (int)st->rules.count) {
+         struct rule *r = &st->rules.rules[st->selected];
+         char msg[64];
+         snprintf(msg, sizeof(msg), "Delete rule '%s'?", r->name ? r->name : "(unnamed)");
+         if (confirm_dialog(height, width, "Delete Rule", msg)) {
+             /* record history before deletion */
+             struct rule deleted_copy = *r;
+             char desc[128];
+             snprintf(desc, sizeof(desc), "Delete rule %d", st->selected);
+             history_record(&st->history, CHANGE_DELETE, st->selected, &deleted_copy, NULL, desc);
+             
+             /* remove from array */
+             for (int i = st->selected; i < (int)st->rules.count - 1; i++) {
+                 st->rules.rules[i] = st->rules.rules[i + 1];
+                 if (st->rule_status) st->rule_status[i] = st->rule_status[i + 1];
+             }
+             st->rules.count--;
+             if (st->selected >= (int)st->rules.count && st->selected > 0) st->selected--;
+             st->modified = 1;
+             set_status(st, "Rule deleted (not saved to file)");
+         }
+     }
     /* disable rule - move to .disabled file */
     else if (ch == 'x' && st->selected >= 0 && st->selected < (int)st->rules.count) {
         struct rule *r = &st->rules.rules[st->selected];
@@ -1616,19 +1803,78 @@ static void handle_rules_input(ui_state_machine_t *sm, int ch) {
             get_disabled_path(expanded ? expanded : st->rules_path, disabled_path, sizeof(disabled_path));
             free(expanded);
 
-            if (write_rule_to_file(disabled_path, r, "a") == 0) {
-                /* remove from array */
-                for (int i = st->selected; i < (int)st->rules.count - 1; i++) {
-                    st->rules.rules[i] = st->rules.rules[i + 1];
-                    if (st->rule_status) st->rule_status[i] = st->rule_status[i + 1];
-                }
-                st->rules.count--;
-                if (st->selected >= (int)st->rules.count && st->selected > 0) st->selected--;
-                st->modified = 1;
-                set_status(st, "Rule disabled -> %s", disabled_path);
+             if (write_rule_to_file(disabled_path, r, "a") == 0) {
+                 /* record history before disabling */
+                 struct rule disabled_copy = *r;
+                 char desc[128];
+                 snprintf(desc, sizeof(desc), "Disable rule %d", st->selected);
+                 history_record(&st->history, CHANGE_DISABLE, st->selected, &disabled_copy, NULL, desc);
+                 
+                 /* remove from array */
+                 for (int i = st->selected; i < (int)st->rules.count - 1; i++) {
+                     st->rules.rules[i] = st->rules.rules[i + 1];
+                     if (st->rule_status) st->rule_status[i] = st->rule_status[i + 1];
+                 }
+                 st->rules.count--;
+                 if (st->selected >= (int)st->rules.count && st->selected > 0) st->selected--;
+                 st->modified = 1;
+                 set_status(st, "Rule disabled -> %s", disabled_path);
+             } else {
+                 set_status(st, "Failed to write to %s", disabled_path);
+             }
+        }
+    }
+    /* save */
+    else if (ch == 19) {  /* Ctrl+S */
+        if (st->modified) {
+            char *path = expand_path(st->rules_path);
+            if (export_save_rules(path ? path : st->rules_path, path ? path : st->rules_path, &st->rules) == 0) {
+                st->modified = 0;
+                set_status(st, "Rules saved to %s", path ? path : st->rules_path);
             } else {
-                set_status(st, "Failed to write to %s", disabled_path);
+                set_status(st, "Failed to save rules");
             }
+            free(path);
+        } else {
+            set_status(st, "No changes to save");
+        }
+    }
+    /* undo */
+    else if (ch == 26) {  /* Ctrl+Z */
+        if (history_can_undo(&st->history)) {
+            struct rule *old_rule = history_undo(&st->history);
+            if (old_rule && st->selected >= 0 && st->selected < (int)st->rules.count) {
+                /* cleanup old rule fields to prevent memory leak */
+                cleanup_rule(&st->rules.rules[st->selected]);
+                
+                /* restore the old state */
+                st->rules.rules[st->selected] = *old_rule;
+                st->modified = 1;
+                st->analysis_loaded = 0;  /* invalidate analysis cache */
+                set_status(st, "Undo complete");
+                free(old_rule);
+            }
+        } else {
+            set_status(st, "Nothing to undo");
+        }
+    }
+    /* redo */
+    else if (ch == 25) {  /* Ctrl+Y */
+        if (history_can_redo(&st->history)) {
+            struct rule *new_rule = history_redo(&st->history);
+            if (new_rule && st->selected >= 0 && st->selected < (int)st->rules.count) {
+                /* cleanup old rule fields to prevent memory leak */
+                cleanup_rule(&st->rules.rules[st->selected]);
+                
+                /* restore the new state */
+                st->rules.rules[st->selected] = *new_rule;
+                st->modified = 1;
+                st->analysis_loaded = 0;  /* invalidate analysis cache */
+                set_status(st, "Redo complete");
+                free(new_rule);
+            }
+        } else {
+            set_status(st, "Nothing to redo");
         }
     }
 }
@@ -1692,6 +1938,8 @@ int run_tui(void) {
     st.mode = VIEW_RULES;
     st.suggest_rules = 1;
     st.show_overlaps = 1;
+    st.grouping = GROUP_BY_WORKSPACE;
+    history_init(&st.history);
     init_paths(&st);
 
     setlocale(LC_ALL, "");
@@ -1759,7 +2007,7 @@ int run_tui(void) {
                         int clicked_idx = st.scroll + list_row;
                         if (clicked_idx >= 0 && clicked_idx < (int)st.rules.count) {
                             st.selected = clicked_idx;
-                            if (edit_rule_modal(&st.rules.rules[st.selected], height, width)) {
+                            if (edit_rule_modal(&st.rules.rules[st.selected], st.selected, &st.history, height, width)) {
                                 st.modified = 1;
                                 set_status(&st, "Rule modified (not saved to file)");
                             }
@@ -1823,5 +2071,20 @@ int run_tui(void) {
     free(st.rule_status);
     missing_rules_free(&st.missing);
     free(st.review_text);
+    
+    /* cleanup analysis and cascade */
+    if (st.analysis_report) {
+        analysis_free(st.analysis_report);
+    }
+    if (st.cascade_cache) {
+        for (size_t i = 0; i < st.cascade_count; i++) {
+            if (st.cascade_cache[i]) {
+                cascade_free(st.cascade_cache[i]);
+            }
+        }
+        free(st.cascade_cache);
+    }
+    history_free(&st.history);
+    
     return 0;
 }
