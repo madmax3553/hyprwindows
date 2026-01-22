@@ -19,7 +19,8 @@ SRC = \
 	src/naming.c \
 	src/cascade.c \
 	src/analysis.c \
-	src/history.c
+	src/history.c \
+	src/export_rules.c
 
 OBJ = $(SRC:.c=.o)
 
