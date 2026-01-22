@@ -357,7 +357,9 @@ int rule_matches_client(const struct rule *r, const struct client *c) {
         }
     }
     if (r->match.tag_re) {
-        return 0;
+        if (!c->workspace_name || !regex_match(r->match.tag_re, c->workspace_name)) {
+            return 0;
+        }
     }
     return 1;
 }

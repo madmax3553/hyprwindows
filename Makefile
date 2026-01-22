@@ -15,7 +15,11 @@ SRC = \
 	src/actions.c \
 	src/ui.c \
 	src/hyprconf.c \
-	src/simplejson.c
+	src/simplejson.c \
+	src/naming.c \
+	src/cascade.c \
+	src/analysis.c \
+	src/history.c
 
 OBJ = $(SRC:.c=.o)
 

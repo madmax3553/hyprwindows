@@ -11,6 +11,11 @@
 #include "actions.h"
 #include "hyprctl.h"
 #include "rules.h"
+#include "util.h"
+#include "naming.h"
+#include "cascade.h"
+#include "analysis.h"
+#include "history.h"
 
 #define UI_MIN_WIDTH 80
 #define UI_MIN_HEIGHT 24
@@ -29,6 +34,9 @@ enum rule_status {
     RULE_UNUSED = 1,      /* no matching window */
     RULE_DUPLICATE = 2,   /* same pattern as another rule */
 };
+
+struct ui_state_machine;
+typedef struct ui_state_machine ui_state_machine_t;
 
 struct ui_state {
     enum view_mode mode;
@@ -60,6 +68,17 @@ struct ui_state {
     char status[256];
 };
 
+struct ui_state_machine {
+    enum view_mode current_state;
+    int running;
+    struct ui_state *st;
+
+    void (*handle_rules_input)(ui_state_machine_t*, int);
+    void (*handle_windows_input)(ui_state_machine_t*, int);
+    void (*handle_review_input)(ui_state_machine_t*, int);
+    void (*handle_settings_input)(ui_state_machine_t*, int);
+};
+
 /* colors */
 enum {
     COL_TITLE = 1,
@@ -76,6 +95,12 @@ enum {
 /* forward declarations */
 static void clean_class_name(const char *regex, char *out, size_t out_sz);
 static void update_display_name(struct rule *r);
+static void draw_ui(ui_state_machine_t *sm);
+static void handle_input(ui_state_machine_t *sm, int ch);
+static void handle_rules_input(ui_state_machine_t *sm, int ch);
+static void handle_windows_input(ui_state_machine_t *sm, int ch);
+static void handle_review_input(ui_state_machine_t *sm, int ch);
+static void handle_settings_input(ui_state_machine_t *sm, int ch);
 
 static void set_status(struct ui_state *st, const char *fmt, ...) {
     va_list args;
@@ -1184,6 +1209,138 @@ static int edit_rule_modal(struct rule *r, int scr_h, int scr_w) {
     }
 }
 
+/* search/filter helpers */
+static void search_init(struct search_state *s) __attribute__((unused));
+static void search_init(struct search_state *s) {
+    if (!s) return;
+    memset(s, 0, sizeof(struct search_state));
+    s->matches = malloc(1000 * sizeof(int));  /* Max 1000 matches */
+}
+
+static void search_free(struct search_state *s) __attribute__((unused));
+static void search_free(struct search_state *s) {
+    if (!s) return;
+    free(s->matches);
+    memset(s, 0, sizeof(struct search_state));
+}
+
+static void search_update(struct search_state *s, struct ruleset *rs) {
+    if (!s || !rs) return;
+    
+    s->match_count = 0;
+    if (!s->query[0]) {
+        s->active = 0;
+        return;  /* Empty query, no filtering */
+    }
+    
+    s->active = 1;
+    
+    for (size_t i = 0; i < rs->count && s->match_count < 999; i++) {
+        struct rule *r = &rs->rules[i];
+        
+        /* Search in name, class, title, tag, workspace */
+        const char *name = r->display_name ? r->display_name : "";
+        const char *class_re = r->match.class_re ? r->match.class_re : "";
+        const char *title_re = r->match.title_re ? r->match.title_re : "";
+        const char *tag = r->actions.tag ? r->actions.tag : "";
+        const char *workspace = r->actions.workspace ? r->actions.workspace : "";
+        
+        /* Case-insensitive substring search */
+        char *lower_query = strdup(s->query);
+        str_to_lower(lower_query);
+        
+        char name_lower[128];
+        snprintf(name_lower, sizeof(name_lower), "%s", name);
+        str_to_lower(name_lower);
+        
+        if (strstr(name_lower, lower_query) != NULL ||
+            strstr(class_re, s->query) != NULL ||
+            strstr(title_re, s->query) != NULL ||
+            strstr(tag, s->query) != NULL ||
+            strstr(workspace, s->query) != NULL) {
+            s->matches[s->match_count++] = i;
+        }
+        
+        free(lower_query);
+    }
+    
+    s->current_match = 0;  /* Reset to first match */
+}
+
+static void search_next(struct search_state *s) {
+    if (!s || s->match_count == 0) return;
+    s->current_match = (s->current_match + 1) % s->match_count;
+}
+
+static void search_prev(struct search_state *s) {
+    if (!s || s->match_count == 0) return;
+    if (s->current_match == 0) {
+        s->current_match = (int)s->match_count - 1;
+    } else {
+        s->current_match--;
+    }
+}
+
+static int search_modal(struct search_state *s, struct ruleset *rs, int scr_h, int scr_w) __attribute__((unused));
+static int search_modal(struct search_state *s, struct ruleset *rs, int scr_h, int scr_w) {
+    /* Display search modal and handle input */
+    int h = 7, w = 60;
+    int y = (scr_h - h) / 2;
+    int x = (scr_w - w) / 2;
+    
+    while (1) {
+        clear();
+        attron(COLOR_PAIR(COL_BORDER));
+        for (int i = 0; i < h; i++) mvhline(y + i, x, ' ', w);
+        draw_box(y, x, h, w, "Search Rules");
+        attroff(COLOR_PAIR(COL_BORDER));
+        
+        /* Input field */
+        mvprintw(y + 2, x + 2, "Query: ");
+        attron(COLOR_PAIR(COL_SELECT));
+        mvprintw(y + 2, x + 10, "%-46s_", s->query);
+        attroff(COLOR_PAIR(COL_SELECT));
+        
+        /* Results summary */
+        if (s->match_count > 0) {
+            mvprintw(y + 4, x + 2, "Found %zu matches (n/N to navigate)", s->match_count);
+        } else {
+            mvprintw(y + 4, x + 2, "No matches");
+        }
+        
+        mvprintw(y + 5, x + 2, "Enter to jump, Esc to close");
+        
+        refresh();
+        curs_set(1);
+        
+        int ch = getch();
+        size_t len = strlen(s->query);
+        
+        if (ch == '\n' || ch == KEY_ENTER) {
+            curs_set(0);
+            if (s->match_count > 0) {
+                return s->matches[s->current_match];  /* Return selected rule index */
+            }
+            return -1;
+        } else if (ch == 27) {  /* ESC */
+            curs_set(0);
+            return -1;
+        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (len > 0) {
+                s->query[len - 1] = '\0';
+                search_update(s, rs);
+            }
+        } else if (ch == 'n' || ch == 'N') {
+            if (ch == 'n') search_next(s);
+            else search_prev(s);
+        } else if (ch >= 32 && ch < 127 && len < sizeof(s->query) - 1) {
+            s->query[len] = ch;
+            s->query[len + 1] = '\0';
+            search_update(s, rs);
+        }
+    }
+}
+
 /* splash screen */
 static void draw_splash(int height, int width) {
     const char *lines[] = {
@@ -1232,6 +1389,302 @@ static void draw_loading(int height, int width, const char *msg) {
     refresh();
 }
 
+/* draw UI based on current state */
+static void draw_ui(ui_state_machine_t *sm) {
+    struct ui_state *st = sm->st;
+    int height, width;
+    getmaxyx(stdscr, height, width);
+
+    if (height < UI_MIN_HEIGHT || width < UI_MIN_WIDTH) {
+        clear();
+        mvprintw(height / 2, 0, "Resize to %dx%d", UI_MIN_WIDTH, UI_MIN_HEIGHT);
+        refresh();
+        return;
+    }
+
+    clear();
+
+    /* header */
+    if (st->modified) {
+        draw_header(width, "hyprwindows [*]");
+    } else {
+        draw_header(width, "hyprwindows");
+    }
+
+    /* tabs */
+    draw_tabs(1, width, sm->current_state);
+
+    /* main content area */
+    int content_y = 2;
+    int content_h = height - 4;
+
+    switch (sm->current_state) {
+    case VIEW_RULES:
+        if (width > 100) {
+            /* split view: list + detail */
+            int list_w = width * 2 / 3;
+            draw_rules_view(st, content_y, content_h, list_w);
+            draw_rule_detail(st, content_y, list_w, content_h, width - list_w);
+        } else {
+            draw_rules_view(st, content_y, content_h, width);
+        }
+        break;
+    case VIEW_WINDOWS:
+        draw_windows_view(st, content_y, content_h, width);
+        break;
+    case VIEW_REVIEW:
+        draw_review_view(st, content_y, content_h, width);
+        break;
+    case VIEW_SETTINGS:
+        draw_settings_view(st, content_y, content_h, width);
+        break;
+    }
+
+    /* status bar - view-specific help */
+    const char *help;
+    switch (sm->current_state) {
+    case VIEW_RULES:
+        help = "Enter:Edit  d:Del  x:Disable  s:Save  b:Backup  q:Quit";
+        break;
+    default:
+        help = "1-4:Views  ↑↓:Nav  s:Save  b:Backup  r:Reload  q:Quit";
+        break;
+    }
+    draw_statusbar(height - 1, width, st->status, help);
+
+    refresh();
+}
+
+/* handle global keys (applicable to all views) */
+static void handle_global_keys(ui_state_machine_t *sm, int ch) {
+    struct ui_state *st = sm->st;
+    int height, width;
+    getmaxyx(stdscr, height, width);
+
+    /* quit */
+    if (ch == 'q' || ch == 'Q') {
+        if (st->modified) {
+            /* prompt to save */
+            int choice = 0;
+            while (1) {
+                int dh = 9, dw = 50;
+                int dy = (height - dh) / 2;
+                int dx = (width - dw) / 2;
+
+                attron(COLOR_PAIR(COL_BORDER));
+                for (int i = 0; i < dh; i++) mvhline(dy + i, dx, ' ', dw);
+                draw_box(dy, dx, dh, dw, "Unsaved Changes");
+                attroff(COLOR_PAIR(COL_BORDER));
+
+                mvprintw(dy + 2, dx + 3, "You have unsaved changes.");
+                mvprintw(dy + 3, dx + 3, "What would you like to do?");
+
+                const char *opts[] = {"Save and quit", "Quit without saving", "Cancel"};
+                for (int i = 0; i < 3; i++) {
+                    if (i == choice) attron(COLOR_PAIR(COL_SELECT));
+                    else attron(COLOR_PAIR(COL_DIM));
+                    mvprintw(dy + 5 + i, dx + 5, " %s ", opts[i]);
+                    if (i == choice) attroff(COLOR_PAIR(COL_SELECT));
+                    else attroff(COLOR_PAIR(COL_DIM));
+                }
+                refresh();
+
+                int c = getch();
+                if (c == KEY_UP && choice > 0) choice--;
+                else if (c == KEY_DOWN && choice < 2) choice++;
+                else if (c == '\n' || c == KEY_ENTER) break;
+                else if (c == 27) { choice = 2; break; }  /* ESC = cancel */
+                else if (c == 's' || c == 'S') { choice = 0; break; }
+                else if (c == 'q') { choice = 1; break; }
+            }
+
+            if (choice == 0) {
+                /* save and quit */
+                if (!st->backup_created) create_backup(st);
+                if (save_rules(st) == 0) {
+                    set_status(st, "Saved to %s", st->rules_path);
+                }
+                sm->running = 0;
+            } else if (choice == 1) {
+                /* quit without saving */
+                sm->running = 0;
+            }
+            /* choice == 2: cancel, continue */
+        } else {
+            sm->running = 0;
+        }
+        return;
+    }
+
+    /* save */
+    if (ch == 's' || ch == 'S') {
+        if (!st->backup_created) {
+            if (create_backup(st) == 0) {
+                set_status(st, "Backup created: %s", st->backup_path);
+            }
+        }
+        if (save_rules(st) == 0) {
+            set_status(st, "Saved %zu rules to %s", st->rules.count, st->rules_path);
+        } else {
+            set_status(st, "Failed to save rules");
+        }
+        return;
+    }
+
+    /* backup only */
+    if (ch == 'b' || ch == 'B') {
+        if (create_backup(st) == 0) {
+            set_status(st, "Backup created: %s", st->backup_path);
+        } else {
+            set_status(st, "Failed to create backup");
+        }
+        return;
+    }
+
+    /* view switching */
+    if (ch == '1') { sm->current_state = VIEW_RULES; st->selected = 0; st->scroll = 0; return; }
+    if (ch == '2') { sm->current_state = VIEW_WINDOWS; st->scroll = 0; return; }
+    if (ch == '3') { sm->current_state = VIEW_REVIEW; return; }
+    if (ch == '4') { sm->current_state = VIEW_SETTINGS; st->selected = 0; return; }
+
+    /* reload */
+    if (ch == 'r' || ch == 'R') {
+        if (st->modified) {
+            if (!confirm_dialog(height, width, "Reload", "Discard unsaved changes?")) {
+                return;
+            }
+        }
+        draw_loading(height, width, "Reloading...");
+        load_rules(st);
+        return;
+    }
+}
+
+/* handle input for rules view */
+static void handle_rules_input(ui_state_machine_t *sm, int ch) {
+    struct ui_state *st = sm->st;
+    int height, width;
+    getmaxyx(stdscr, height, width);
+
+    if (ch == KEY_UP && st->selected > 0) st->selected--;
+    else if (ch == KEY_DOWN && st->selected < (int)st->rules.count - 1) st->selected++;
+    else if (ch == KEY_PPAGE) { st->selected -= 10; if (st->selected < 0) st->selected = 0; }
+    else if (ch == KEY_NPAGE) { st->selected += 10; if (st->selected >= (int)st->rules.count) st->selected = (int)st->rules.count - 1; }
+    else if (ch == KEY_HOME) st->selected = 0;
+    else if (ch == KEY_END) st->selected = (int)st->rules.count - 1;
+    /* search with / key */
+    else if (ch == '/') {
+        struct search_state search;
+        search_init(&search);
+        int result = search_modal(&search, &st->rules, height, width);
+        if (result >= 0) {
+            st->selected = result;
+        }
+        search_free(&search);
+    }
+    else if ((ch == '\n' || ch == KEY_ENTER) && st->selected >= 0 && st->selected < (int)st->rules.count) {
+        if (edit_rule_modal(&st->rules.rules[st->selected], height, width)) {
+            st->modified = 1;
+            set_status(st, "Rule modified (not saved to file)");
+        }
+    }
+    /* delete rule */
+    else if ((ch == 'd' || ch == KEY_DC) && st->selected >= 0 && st->selected < (int)st->rules.count) {
+        struct rule *r = &st->rules.rules[st->selected];
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Delete rule '%s'?", r->name ? r->name : "(unnamed)");
+        if (confirm_dialog(height, width, "Delete Rule", msg)) {
+            /* remove from array */
+            for (int i = st->selected; i < (int)st->rules.count - 1; i++) {
+                st->rules.rules[i] = st->rules.rules[i + 1];
+                if (st->rule_status) st->rule_status[i] = st->rule_status[i + 1];
+            }
+            st->rules.count--;
+            if (st->selected >= (int)st->rules.count && st->selected > 0) st->selected--;
+            st->modified = 1;
+            set_status(st, "Rule deleted (not saved to file)");
+        }
+    }
+    /* disable rule - move to .disabled file */
+    else if (ch == 'x' && st->selected >= 0 && st->selected < (int)st->rules.count) {
+        struct rule *r = &st->rules.rules[st->selected];
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Disable rule '%s'?", r->name ? r->name : "(unnamed)");
+        if (confirm_dialog(height, width, "Disable Rule", msg)) {
+            char disabled_path[512];
+            char *expanded = expand_path(st->rules_path);
+            get_disabled_path(expanded ? expanded : st->rules_path, disabled_path, sizeof(disabled_path));
+            free(expanded);
+
+            if (write_rule_to_file(disabled_path, r, "a") == 0) {
+                /* remove from array */
+                for (int i = st->selected; i < (int)st->rules.count - 1; i++) {
+                    st->rules.rules[i] = st->rules.rules[i + 1];
+                    if (st->rule_status) st->rule_status[i] = st->rule_status[i + 1];
+                }
+                st->rules.count--;
+                if (st->selected >= (int)st->rules.count && st->selected > 0) st->selected--;
+                st->modified = 1;
+                set_status(st, "Rule disabled -> %s", disabled_path);
+            } else {
+                set_status(st, "Failed to write to %s", disabled_path);
+            }
+        }
+    }
+}
+
+/* handle input for windows view */
+static void handle_windows_input(ui_state_machine_t *sm, int ch) {
+    struct ui_state *st = sm->st;
+
+    if (ch == KEY_UP || ch == KEY_PPAGE) { st->scroll -= (ch == KEY_PPAGE ? 10 : 1); if (st->scroll < 0) st->scroll = 0; }
+    if (ch == KEY_DOWN || ch == KEY_NPAGE) st->scroll += (ch == KEY_NPAGE ? 10 : 1);
+}
+
+/* handle input for review view */
+static void handle_review_input(ui_state_machine_t *sm, int ch) {
+    struct ui_state *st = sm->st;
+
+    if (ch == KEY_UP || ch == KEY_PPAGE) { st->scroll -= (ch == KEY_PPAGE ? 10 : 1); if (st->scroll < 0) st->scroll = 0; }
+    if (ch == KEY_DOWN || ch == KEY_NPAGE) st->scroll += (ch == KEY_NPAGE ? 10 : 1);
+}
+
+/* handle input for settings view */
+static void handle_settings_input(ui_state_machine_t *sm, int ch) {
+    struct ui_state *st = sm->st;
+
+    if (ch == KEY_UP && st->selected > 0) st->selected--;
+    if (ch == KEY_DOWN && st->selected < 4) st->selected++;
+    if (ch == ' ' || ch == '\n') {
+        if (st->selected == 3) st->suggest_rules = !st->suggest_rules;
+        if (st->selected == 4) st->show_overlaps = !st->show_overlaps;
+    }
+}
+
+/* dispatch input to appropriate handler based on view */
+static void handle_input(ui_state_machine_t *sm, int ch) {
+    /* global keys apply to all views */
+    handle_global_keys(sm, ch);
+    
+    /* if still running, dispatch to view-specific handler */
+    if (!sm->running) return;
+
+    switch (sm->current_state) {
+    case VIEW_RULES:
+        handle_rules_input(sm, ch);
+        break;
+    case VIEW_WINDOWS:
+        handle_windows_input(sm, ch);
+        break;
+    case VIEW_REVIEW:
+        handle_review_input(sm, ch);
+        break;
+    case VIEW_SETTINGS:
+        handle_settings_input(sm, ch);
+        break;
+    }
+}
+
 /* main entry */
 int run_tui(void) {
     struct ui_state st;
@@ -1275,73 +1728,23 @@ int run_tui(void) {
     draw_loading(height, width, "Loading rules...");
     load_rules(&st);
 
-    int running = 1;
-    while (running) {
+    /* initialize state machine */
+    ui_state_machine_t sm;
+    sm.current_state = VIEW_RULES;
+    sm.running = 1;
+    sm.st = &st;
+    sm.handle_rules_input = handle_rules_input;
+    sm.handle_windows_input = handle_windows_input;
+    sm.handle_review_input = handle_review_input;
+    sm.handle_settings_input = handle_settings_input;
+
+    /* main loop */
+    while (sm.running) {
         getmaxyx(stdscr, height, width);
-
-        if (height < UI_MIN_HEIGHT || width < UI_MIN_WIDTH) {
-            clear();
-            mvprintw(height / 2, 0, "Resize to %dx%d", UI_MIN_WIDTH, UI_MIN_HEIGHT);
-            refresh();
-            if (getch() == 'q') break;
-            continue;
-        }
-
-        clear();
-
-        /* header */
-        if (st.modified) {
-            draw_header(width, "hyprwindows [*]");
-        } else {
-            draw_header(width, "hyprwindows");
-        }
-
-        /* tabs */
-        draw_tabs(1, width, st.mode);
-
-        /* main content area */
-        int content_y = 2;
-        int content_h = height - 4;
-
-        switch (st.mode) {
-        case VIEW_RULES:
-            if (width > 100) {
-                /* split view: list + detail */
-                int list_w = width * 2 / 3;
-                draw_rules_view(&st, content_y, content_h, list_w);
-                draw_rule_detail(&st, content_y, list_w, content_h, width - list_w);
-            } else {
-                draw_rules_view(&st, content_y, content_h, width);
-            }
-            break;
-        case VIEW_WINDOWS:
-            draw_windows_view(&st, content_y, content_h, width);
-            break;
-        case VIEW_REVIEW:
-            draw_review_view(&st, content_y, content_h, width);
-            break;
-        case VIEW_SETTINGS:
-            draw_settings_view(&st, content_y, content_h, width);
-            break;
-        }
-
-        /* status bar - view-specific help */
-        const char *help;
-        switch (st.mode) {
-        case VIEW_RULES:
-            help = "Enter:Edit  d:Del  x:Disable  s:Save  b:Backup  q:Quit";
-            break;
-        default:
-            help = "1-4:Views  ↑↓:Nav  s:Save  b:Backup  r:Reload  q:Quit";
-            break;
-        }
-        draw_statusbar(height - 1, width, st.status, help);
-
-        refresh();
-
-        int ch = getch();
-
+        draw_ui(&sm);
+        
         /* handle mouse events */
+        int ch = getch();
         if (ch == KEY_MOUSE) {
             MEVENT event;
             if (getmouse(&event) == OK) {
@@ -1349,7 +1752,7 @@ int run_tui(void) {
                 int dblclick = event.bstate & BUTTON1_DOUBLE_CLICKED;
 
                 /* double-click to edit (check FIRST, before single click) */
-                if (st.mode == VIEW_RULES && dblclick && event.y > 3) {
+                if (sm.current_state == VIEW_RULES && dblclick && event.y > 3) {
                     int content_y = 2;
                     int list_row = event.y - content_y - 2;
                     if (list_row >= 0) {
@@ -1368,26 +1771,26 @@ int run_tui(void) {
                     /* calculate tab positions based on actual tab strings */
                     /* [1] Rules  [2] Windows  [3] Review  [4] Settings */
                     if (event.x >= 2 && event.x < 14) {
-                        st.mode = VIEW_RULES; st.selected = 0; st.scroll = 0;
+                        sm.current_state = VIEW_RULES; st.selected = 0; st.scroll = 0;
                     } else if (event.x >= 15 && event.x < 29) {
-                        st.mode = VIEW_WINDOWS; st.scroll = 0;
+                        sm.current_state = VIEW_WINDOWS; st.scroll = 0;
                     } else if (event.x >= 30 && event.x < 43) {
-                        st.mode = VIEW_REVIEW;
+                        sm.current_state = VIEW_REVIEW;
                     } else if (event.x >= 44 && event.x < 60) {
-                        st.mode = VIEW_SETTINGS; st.selected = 0;
+                        sm.current_state = VIEW_SETTINGS; st.selected = 0;
                     }
                 }
                 /* scroll wheel */
                 else if (event.bstate & BUTTON4_PRESSED) {  /* scroll up */
-                    if (st.mode == VIEW_RULES && st.selected > 0) st.selected--;
-                    else if (st.mode == VIEW_WINDOWS && st.scroll > 0) st.scroll--;
+                    if (sm.current_state == VIEW_RULES && st.selected > 0) st.selected--;
+                    else if (sm.current_state == VIEW_WINDOWS && st.scroll > 0) st.scroll--;
                 }
                 else if (event.bstate & BUTTON5_PRESSED) {  /* scroll down */
-                    if (st.mode == VIEW_RULES && st.selected < (int)st.rules.count - 1) st.selected++;
-                    else if (st.mode == VIEW_WINDOWS) st.scroll++;
+                    if (sm.current_state == VIEW_RULES && st.selected < (int)st.rules.count - 1) st.selected++;
+                    else if (sm.current_state == VIEW_WINDOWS) st.scroll++;
                 }
                 /* click in rules list */
-                else if (st.mode == VIEW_RULES && click && event.y > 3) {
+                else if (sm.current_state == VIEW_RULES && click && event.y > 3) {
                     int content_y = 2;
                     int list_row = event.y - content_y - 2;  /* -2 for box border and header */
                     if (list_row >= 0 && event.x > 0 && event.x < width * 2 / 3) {
@@ -1398,7 +1801,7 @@ int run_tui(void) {
                     }
                 }
                 /* click in settings to toggle */
-                else if (st.mode == VIEW_SETTINGS && click) {
+                else if (sm.current_state == VIEW_SETTINGS && click) {
                     int content_y = 2;
                     int row = (event.y - content_y - 2) / 2;  /* settings rows are spaced by 2 */
                     if (row >= 0 && row <= 4) {
@@ -1411,175 +1814,8 @@ int run_tui(void) {
             continue;
         }
 
-        /* global keys */
-        if (ch == 'q' || ch == 'Q') {
-            if (st.modified) {
-                /* prompt to save */
-                int choice = 0;
-                while (1) {
-                    int dh = 9, dw = 50;
-                    int dy = (height - dh) / 2;
-                    int dx = (width - dw) / 2;
-
-                    attron(COLOR_PAIR(COL_BORDER));
-                    for (int i = 0; i < dh; i++) mvhline(dy + i, dx, ' ', dw);
-                    draw_box(dy, dx, dh, dw, "Unsaved Changes");
-                    attroff(COLOR_PAIR(COL_BORDER));
-
-                    mvprintw(dy + 2, dx + 3, "You have unsaved changes.");
-                    mvprintw(dy + 3, dx + 3, "What would you like to do?");
-
-                    const char *opts[] = {"Save and quit", "Quit without saving", "Cancel"};
-                    for (int i = 0; i < 3; i++) {
-                        if (i == choice) attron(COLOR_PAIR(COL_SELECT));
-                        else attron(COLOR_PAIR(COL_DIM));
-                        mvprintw(dy + 5 + i, dx + 5, " %s ", opts[i]);
-                        if (i == choice) attroff(COLOR_PAIR(COL_SELECT));
-                        else attroff(COLOR_PAIR(COL_DIM));
-                    }
-                    refresh();
-
-                    int c = getch();
-                    if (c == KEY_UP && choice > 0) choice--;
-                    else if (c == KEY_DOWN && choice < 2) choice++;
-                    else if (c == '\n' || c == KEY_ENTER) break;
-                    else if (c == 27) { choice = 2; break; }  /* ESC = cancel */
-                    else if (c == 's' || c == 'S') { choice = 0; break; }
-                    else if (c == 'q') { choice = 1; break; }
-                }
-
-                if (choice == 0) {
-                    /* save and quit */
-                    if (!st.backup_created) create_backup(&st);
-                    if (save_rules(&st) == 0) {
-                        set_status(&st, "Saved to %s", st.rules_path);
-                    }
-                    running = 0;
-                } else if (choice == 1) {
-                    /* quit without saving */
-                    running = 0;
-                }
-                /* choice == 2: cancel, continue */
-            } else {
-                running = 0;
-            }
-            continue;
-        }
-        /* save */
-        if (ch == 's' || ch == 'S') {
-            if (!st.backup_created) {
-                if (create_backup(&st) == 0) {
-                    set_status(&st, "Backup created: %s", st.backup_path);
-                }
-            }
-            if (save_rules(&st) == 0) {
-                set_status(&st, "Saved %zu rules to %s", st.rules.count, st.rules_path);
-            } else {
-                set_status(&st, "Failed to save rules");
-            }
-            continue;
-        }
-        /* backup only */
-        if (ch == 'b' || ch == 'B') {
-            if (create_backup(&st) == 0) {
-                set_status(&st, "Backup created: %s", st.backup_path);
-            } else {
-                set_status(&st, "Failed to create backup");
-            }
-            continue;
-        }
-        if (ch == '1') { st.mode = VIEW_RULES; st.selected = 0; st.scroll = 0; continue; }
-        if (ch == '2') { st.mode = VIEW_WINDOWS; st.scroll = 0; continue; }
-        if (ch == '3') { st.mode = VIEW_REVIEW; continue; }
-        if (ch == '4') { st.mode = VIEW_SETTINGS; st.selected = 0; continue; }
-        if (ch == 'r' || ch == 'R') {
-            if (st.modified) {
-                if (!confirm_dialog(height, width, "Reload", "Discard unsaved changes?")) {
-                    continue;
-                }
-            }
-            draw_loading(height, width, "Reloading...");
-            load_rules(&st);
-            continue;
-        }
-
-        /* view-specific keys */
-        switch (st.mode) {
-        case VIEW_RULES:
-            if (ch == KEY_UP && st.selected > 0) st.selected--;
-            if (ch == KEY_DOWN && st.selected < (int)st.rules.count - 1) st.selected++;
-            if (ch == KEY_PPAGE) { st.selected -= 10; if (st.selected < 0) st.selected = 0; }
-            if (ch == KEY_NPAGE) { st.selected += 10; if (st.selected >= (int)st.rules.count) st.selected = (int)st.rules.count - 1; }
-            if (ch == KEY_HOME) st.selected = 0;
-            if (ch == KEY_END) st.selected = (int)st.rules.count - 1;
-            if ((ch == '\n' || ch == KEY_ENTER) && st.selected >= 0 && st.selected < (int)st.rules.count) {
-                if (edit_rule_modal(&st.rules.rules[st.selected], height, width)) {
-                    st.modified = 1;
-                    set_status(&st, "Rule modified (not saved to file)");
-                }
-            }
-            /* delete rule */
-            if ((ch == 'd' || ch == KEY_DC) && st.selected >= 0 && st.selected < (int)st.rules.count) {
-                struct rule *r = &st.rules.rules[st.selected];
-                char msg[64];
-                snprintf(msg, sizeof(msg), "Delete rule '%s'?", r->name ? r->name : "(unnamed)");
-                if (confirm_dialog(height, width, "Delete Rule", msg)) {
-                    /* remove from array */
-                    for (int i = st.selected; i < (int)st.rules.count - 1; i++) {
-                        st.rules.rules[i] = st.rules.rules[i + 1];
-                        if (st.rule_status) st.rule_status[i] = st.rule_status[i + 1];
-                    }
-                    st.rules.count--;
-                    if (st.selected >= (int)st.rules.count && st.selected > 0) st.selected--;
-                    st.modified = 1;
-                    set_status(&st, "Rule deleted (not saved to file)");
-                }
-            }
-            /* disable rule - move to .disabled file */
-            if (ch == 'x' && st.selected >= 0 && st.selected < (int)st.rules.count) {
-                struct rule *r = &st.rules.rules[st.selected];
-                char msg[64];
-                snprintf(msg, sizeof(msg), "Disable rule '%s'?", r->name ? r->name : "(unnamed)");
-                if (confirm_dialog(height, width, "Disable Rule", msg)) {
-                    char disabled_path[512];
-                    char *expanded = expand_path(st.rules_path);
-                    get_disabled_path(expanded ? expanded : st.rules_path, disabled_path, sizeof(disabled_path));
-                    free(expanded);
-
-                    if (write_rule_to_file(disabled_path, r, "a") == 0) {
-                        /* remove from array */
-                        for (int i = st.selected; i < (int)st.rules.count - 1; i++) {
-                            st.rules.rules[i] = st.rules.rules[i + 1];
-                            if (st.rule_status) st.rule_status[i] = st.rule_status[i + 1];
-                        }
-                        st.rules.count--;
-                        if (st.selected >= (int)st.rules.count && st.selected > 0) st.selected--;
-                        st.modified = 1;
-                        set_status(&st, "Rule disabled -> %s", disabled_path);
-                    } else {
-                        set_status(&st, "Failed to write to %s", disabled_path);
-                    }
-                }
-            }
-            break;
-
-        case VIEW_WINDOWS:
-            if (ch == KEY_UP || ch == KEY_PPAGE) { st.scroll -= (ch == KEY_PPAGE ? 10 : 1); if (st.scroll < 0) st.scroll = 0; }
-            if (ch == KEY_DOWN || ch == KEY_NPAGE) st.scroll += (ch == KEY_NPAGE ? 10 : 1);
-            break;
-
-        case VIEW_SETTINGS:
-            if (ch == KEY_UP && st.selected > 0) st.selected--;
-            if (ch == KEY_DOWN && st.selected < 4) st.selected++;
-            if (ch == ' ' || ch == '\n') {
-                if (st.selected == 3) st.suggest_rules = !st.suggest_rules;
-                if (st.selected == 4) st.show_overlaps = !st.show_overlaps;
-            }
-            break;
-
-        default:
-            break;
-        }
+        /* handle keyboard input */
+        handle_input(&sm, ch);
     }
 
     endwin();
