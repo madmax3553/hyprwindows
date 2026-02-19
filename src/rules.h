@@ -2,6 +2,7 @@
 #define HYPRWINDOWS_RULES_H
 
 #include <stddef.h>
+#include <stdio.h>
 
 struct rule_match {
     char *class_re;
@@ -45,6 +46,13 @@ struct ruleset {
 
 int ruleset_load(const char *path, struct ruleset *out);
 void ruleset_free(struct ruleset *set);
+
+/* single rule lifecycle */
+void rule_free(struct rule *r);
+struct rule rule_copy(const struct rule *src);
+
+/* write a rule block to an open FILE stream */
+void rule_write(FILE *f, const struct rule *r);
 
 char *hypr_find_rules_config(void);
 

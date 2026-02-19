@@ -575,16 +575,7 @@ int find_missing_rules(const char *rules_path, const char *appmap_path,
     }
     
     /* expand dotfiles path */
-    char *dotfiles_exp = NULL;
-    if (dotfiles_path && dotfiles_path[0] == '~') {
-        const char *home = getenv("HOME");
-        if (home) {
-            dotfiles_exp = malloc(strlen(home) + strlen(dotfiles_path));
-            if (dotfiles_exp) {
-                sprintf(dotfiles_exp, "%s%s", home, dotfiles_path + 1);
-            }
-        }
-    }
+    char *dotfiles_exp = dotfiles_path ? expand_home(dotfiles_path) : NULL;
     const char *dotfiles = dotfiles_exp ? dotfiles_exp : dotfiles_path;
     
     /* check each appmap entry */

@@ -1,14 +1,16 @@
 #include "rules.h"
 
 #include <ctype.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "hyprconf.h"
+#include "util.h"
 
-static void free_rule(struct rule *r) {
+/* --- single rule lifecycle (public) --- */
+
+void rule_free(struct rule *r) {
     if (!r) {
         return;
     }
@@ -33,12 +35,74 @@ static void free_rule(struct rule *r) {
     free(r->extras);
 }
 
+struct rule rule_copy(const struct rule *src) {
+    struct rule dst = {0};
+    if (!src) return dst;
+
+    dst.name = src->name ? strdup(src->name) : NULL;
+    dst.display_name = src->display_name ? strdup(src->display_name) : NULL;
+
+    dst.match.class_re = src->match.class_re ? strdup(src->match.class_re) : NULL;
+    dst.match.title_re = src->match.title_re ? strdup(src->match.title_re) : NULL;
+    dst.match.initial_class_re = src->match.initial_class_re ? strdup(src->match.initial_class_re) : NULL;
+    dst.match.initial_title_re = src->match.initial_title_re ? strdup(src->match.initial_title_re) : NULL;
+    dst.match.tag_re = src->match.tag_re ? strdup(src->match.tag_re) : NULL;
+
+    dst.actions.tag = src->actions.tag ? strdup(src->actions.tag) : NULL;
+    dst.actions.workspace = src->actions.workspace ? strdup(src->actions.workspace) : NULL;
+    dst.actions.float_set = src->actions.float_set;
+    dst.actions.float_val = src->actions.float_val;
+    dst.actions.center_set = src->actions.center_set;
+    dst.actions.center_val = src->actions.center_val;
+    dst.actions.size = src->actions.size ? strdup(src->actions.size) : NULL;
+    dst.actions.move = src->actions.move ? strdup(src->actions.move) : NULL;
+    dst.actions.opacity = src->actions.opacity ? strdup(src->actions.opacity) : NULL;
+
+    if (src->extras_count > 0) {
+        dst.extras = malloc(src->extras_count * sizeof(struct rule_extra));
+        if (dst.extras) {
+            for (size_t i = 0; i < src->extras_count; i++) {
+                dst.extras[i].key = strdup(src->extras[i].key);
+                dst.extras[i].value = strdup(src->extras[i].value);
+            }
+            dst.extras_count = src->extras_count;
+        }
+    }
+
+    return dst;
+}
+
+void rule_write(FILE *f, const struct rule *r) {
+    if (!f || !r) return;
+
+    fprintf(f, "windowrule {\n");
+    if (r->name) fprintf(f, "    name = %s\n", r->name);
+    if (r->match.class_re) fprintf(f, "    match:class = %s\n", r->match.class_re);
+    if (r->match.title_re) fprintf(f, "    match:title = %s\n", r->match.title_re);
+    if (r->match.initial_class_re) fprintf(f, "    match:initial_class = %s\n", r->match.initial_class_re);
+    if (r->match.initial_title_re) fprintf(f, "    match:initial_title = %s\n", r->match.initial_title_re);
+    if (r->match.tag_re) fprintf(f, "    match:tag = %s\n", r->match.tag_re);
+    if (r->actions.tag) fprintf(f, "    tag = %s\n", r->actions.tag);
+    if (r->actions.workspace) fprintf(f, "    workspace = %s\n", r->actions.workspace);
+    if (r->actions.float_set) fprintf(f, "    float = %s\n", r->actions.float_val ? "true" : "false");
+    if (r->actions.center_set) fprintf(f, "    center = %s\n", r->actions.center_val ? "true" : "false");
+    if (r->actions.size) fprintf(f, "    size = %s\n", r->actions.size);
+    if (r->actions.move) fprintf(f, "    move = %s\n", r->actions.move);
+    if (r->actions.opacity) fprintf(f, "    opacity = %s\n", r->actions.opacity);
+    for (size_t j = 0; j < r->extras_count; j++) {
+        fprintf(f, "    %s = %s\n", r->extras[j].key, r->extras[j].value);
+    }
+    fprintf(f, "}\n\n");
+}
+
+/* --- ruleset --- */
+
 void ruleset_free(struct ruleset *set) {
     if (!set || !set->rules) {
         return;
     }
     for (size_t i = 0; i < set->count; i++) {
-        free_rule(&set->rules[i]);
+        rule_free(&set->rules[i]);
     }
     free(set->rules);
     set->rules = NULL;
@@ -49,60 +113,7 @@ int ruleset_load(const char *path, struct ruleset *out) {
     return hyprconf_parse_file(path, out);
 }
 
-static char *expand_home(const char *path) {
-    if (!path || path[0] != '~') {
-        return strdup(path);
-    }
-    const char *home = getenv("HOME");
-    if (!home) {
-        home = ".";
-    }
-    size_t hlen = strlen(home);
-    size_t plen = strlen(path);
-    char *out = (char *)malloc(hlen + plen);
-    if (!out) {
-        return NULL;
-    }
-    strcpy(out, home);
-    strcat(out, path + 1);
-    return out;
-}
-
-static char *read_file(const char *path, size_t *out_len) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        return NULL;
-    }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return NULL;
-    }
-    long size = ftell(f);
-    if (size < 0) {
-        fclose(f);
-        return NULL;
-    }
-    if (fseek(f, 0, SEEK_SET) != 0) {
-        fclose(f);
-        return NULL;
-    }
-    char *buf = (char *)malloc((size_t)size + 1);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-    size_t nread = fread(buf, 1, (size_t)size, f);
-    fclose(f);
-    if (nread != (size_t)size) {
-        free(buf);
-        return NULL;
-    }
-    buf[size] = '\0';
-    if (out_len) {
-        *out_len = (size_t)size;
-    }
-    return buf;
-}
+/* --- auto-detect config --- */
 
 static int file_has_windowrules(const char *path) {
     char *expanded = expand_home(path);
@@ -138,28 +149,23 @@ char *hypr_find_rules_config(void) {
     /* scan for source = lines and check if they contain windowrules */
     char *line = buf;
     while (line && *line) {
-        /* skip whitespace */
         while (*line && isspace((unsigned char)*line)) {
             line++;
         }
-        /* skip comments */
         if (*line == '#') {
             while (*line && *line != '\n') line++;
             if (*line == '\n') line++;
             continue;
         }
-        /* look for source = */
         if (strncmp(line, "source", 6) == 0) {
             char *p = line + 6;
             while (*p && isspace((unsigned char)*p)) p++;
             if (*p == '=') {
                 p++;
                 while (*p && isspace((unsigned char)*p)) p++;
-                /* extract path */
                 char *start = p;
                 while (*p && *p != '\n' && *p != '#') p++;
                 size_t plen = (size_t)(p - start);
-                /* trim trailing whitespace */
                 while (plen > 0 && isspace((unsigned char)start[plen - 1])) plen--;
                 if (plen > 0) {
                     char *spath = (char *)malloc(plen + 1);
@@ -177,12 +183,10 @@ char *hypr_find_rules_config(void) {
                 }
             }
         }
-        /* next line */
         while (*line && *line != '\n') line++;
         if (*line == '\n') line++;
     }
 
-    /* check if hyprland.conf itself has windowrules */
     if (strstr(buf, "windowrule") != NULL) {
         free(buf);
         return strdup(hyprconf);

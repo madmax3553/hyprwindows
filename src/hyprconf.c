@@ -5,42 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-static char *read_file(const char *path, size_t *out_len) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        return NULL;
-    }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return NULL;
-    }
-    long size = ftell(f);
-    if (size < 0) {
-        fclose(f);
-        return NULL;
-    }
-    if (fseek(f, 0, SEEK_SET) != 0) {
-        fclose(f);
-        return NULL;
-    }
-
-    char *buf = (char *)malloc((size_t)size + 1);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-    size_t nread = fread(buf, 1, (size_t)size, f);
-    fclose(f);
-    if (nread != (size_t)size) {
-        free(buf);
-        return NULL;
-    }
-    buf[size] = '\0';
-    if (out_len) {
-        *out_len = (size_t)size;
-    }
-    return buf;
-}
+#include "util.h"
+#include "vec.h"
 
 static char *strip_comments(const char *src, size_t len, size_t *out_len) {
     char *out = (char *)malloc(len + 1);
@@ -219,17 +185,24 @@ static void parse_rule_kv(struct rule *r, const char *key, char *val) {
         free(val);
         return;
     }
-    /* unknown key - store in extras */
+    /* unknown key - store in extras (grow with doubling) */
     size_t n = r->extras_count;
-    struct rule_extra *new_extras = realloc(r->extras, (n + 1) * sizeof(struct rule_extra));
-    if (new_extras) {
+    /* Check if we need to grow - use doubling strategy */
+    size_t cap = n;  /* current allocation = count (tight) */
+    if (n == 0 || (n & (n - 1)) == 0) {
+        /* need to grow: double or start at 4 */
+        size_t new_cap = n == 0 ? 4 : n * 2;
+        struct rule_extra *new_extras = realloc(r->extras, new_cap * sizeof(struct rule_extra));
+        if (!new_extras) {
+            free(val);
+            return;
+        }
         r->extras = new_extras;
-        r->extras[n].key = strdup(key);
-        r->extras[n].value = val;
-        r->extras_count = n + 1;
-    } else {
-        free(val);
+        (void)cap;
     }
+    r->extras[n].key = strdup(key);
+    r->extras[n].value = val;
+    r->extras_count = n + 1;
 }
 
 static int parse_windowrule_block(const char *buf, size_t len, size_t *pos, struct rule *r) {
