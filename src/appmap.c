@@ -1,16 +1,116 @@
 #include "appmap.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "simplejson.h"
 #include "util.h"
 
-static void free_entry(struct appmap_entry *e) {
-    if (!e) {
-        return;
+/*
+ * Simple parser for appmap.json.
+ * Format is a flat array of objects with known keys:
+ *   { "dotfile": "...", "package": "...", "classes": ["...", ...], "group": "..." }
+ *
+ * We don't need a full JSON parser for this predictable structure.
+ */
+
+/* extract a quoted string value after current position, return strdup'd */
+static char *extract_string(const char *p, const char *end, const char **out_pos) {
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (p >= end || *p != '"') return NULL;
+    p++; /* skip opening quote */
+
+    const char *start = p;
+    while (p < end && *p != '"') {
+        if (*p == '\\' && p + 1 < end) p++;
+        p++;
     }
+    if (p >= end) return NULL;
+
+    size_t len = (size_t)(p - start);
+    char *s = malloc(len + 1);
+    if (!s) return NULL;
+    memcpy(s, start, len);
+    s[len] = '\0';
+
+    if (out_pos) *out_pos = p + 1; /* past closing quote */
+    return s;
+}
+
+/* find "key": in buf, return pointer after the colon, or NULL */
+static const char *find_key(const char *buf, const char *end, const char *key) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    size_t patlen = strlen(pat);
+
+    const char *p = buf;
+    while (p + patlen < end) {
+        p = strstr(p, pat);
+        if (!p || p >= end) return NULL;
+        p += patlen;
+        while (p < end && isspace((unsigned char)*p)) p++;
+        if (p < end && *p == ':') return p + 1;
+    }
+    return NULL;
+}
+
+/* parse "classes": ["a", "b", ...] */
+static int parse_classes(const char *buf, const char *end, struct appmap_entry *e) {
+    const char *p = find_key(buf, end, "classes");
+    if (!p) return 0;
+
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (p >= end || *p != '[') return 0;
+    p++; /* skip '[' */
+
+    size_t cap = 4;
+    e->classes = calloc(cap, sizeof(char *));
+    if (!e->classes) return -1;
+    e->class_count = 0;
+
+    while (p < end && *p != ']') {
+        while (p < end && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if (p >= end || *p == ']') break;
+
+        const char *next = NULL;
+        char *cls = extract_string(p, end, &next);
+        if (!cls) break;
+
+        if (e->class_count >= cap) {
+            cap *= 2;
+            char **tmp = realloc(e->classes, cap * sizeof(char *));
+            if (!tmp) { free(cls); break; }
+            e->classes = tmp;
+        }
+        e->classes[e->class_count++] = cls;
+        p = next;
+    }
+    return 0;
+}
+
+/* find the end of a JSON object starting at '{' */
+static const char *skip_object(const char *p, const char *end) {
+    if (p >= end || *p != '{') return p;
+    int depth = 1;
+    p++;
+    int in_str = 0;
+    while (p < end && depth > 0) {
+        if (in_str) {
+            if (*p == '\\') p++;
+            else if (*p == '"') in_str = 0;
+        } else {
+            if (*p == '"') in_str = 1;
+            else if (*p == '{') depth++;
+            else if (*p == '}') depth--;
+        }
+        p++;
+    }
+    return p;
+}
+
+static void free_entry(struct appmap_entry *e) {
+    if (!e) return;
     free(e->dotfile);
     free(e->package);
     free(e->group);
@@ -18,8 +118,6 @@ static void free_entry(struct appmap_entry *e) {
         free(e->classes[i]);
     }
     free(e->classes);
-    e->classes = NULL;
-    e->class_count = 0;
 }
 
 int appmap_load(const char *path, struct appmap *out) {
@@ -27,99 +125,63 @@ int appmap_load(const char *path, struct appmap *out) {
 
     size_t len = 0;
     char *buf = read_file(path, &len);
-    if (!buf) {
-        return -1;
+    if (!buf) return -1;
+
+    const char *end = buf + len;
+
+    /* count top-level objects */
+    size_t count = 0;
+    int depth = 0;
+    for (const char *p = buf; p < end; p++) {
+        if (*p == '[') depth++;
+        else if (*p == ']') depth--;
+        else if (*p == '{' && depth == 1) count++;
     }
 
-    struct sjson_value root;
-    if (sjson_parse(buf, len, &root) != 0) {
-        free(buf);
-        return -1;
+    if (count == 0) { free(buf); return 0; }
+
+    struct appmap_entry *entries = calloc(count, sizeof(struct appmap_entry));
+    if (!entries) { free(buf); return -1; }
+
+    const char *p = buf;
+    size_t idx = 0;
+    while (p < end && idx < count) {
+        while (p < end && *p != '{') p++;
+        if (p >= end) break;
+
+        const char *obj_start = p;
+        const char *obj_end = skip_object(p, end);
+
+        struct appmap_entry *e = &entries[idx];
+
+        const char *val;
+        val = find_key(obj_start, obj_end, "dotfile");
+        if (val) e->dotfile = extract_string(val, obj_end, NULL);
+
+        val = find_key(obj_start, obj_end, "package");
+        if (val) e->package = extract_string(val, obj_end, NULL);
+
+        val = find_key(obj_start, obj_end, "group");
+        if (val) e->group = extract_string(val, obj_end, NULL);
+
+        parse_classes(obj_start, obj_end, e);
+
+        idx++;
+        p = obj_end;
     }
+
     free(buf);
-
-    if (root.type != SJSON_ARRAY) {
-        sjson_free(&root);
-        return -1;
-    }
-
-    size_t count = sjson_array_len(&root);
-    if (count == 0) {
-        sjson_free(&root);
-        return 0;
-    }
-
-    struct appmap_entry *entries = (struct appmap_entry *)calloc(count, sizeof(struct appmap_entry));
-    if (!entries) {
-        sjson_free(&root);
-        return -1;
-    }
-
-    for (size_t i = 0; i < count; i++) {
-        const struct sjson_value *item = sjson_array_at(&root, i);
-        if (!item || item->type != SJSON_OBJECT) {
-            continue;
-        }
-        struct appmap_entry *e = &entries[i];
-
-        const char *dotfile = sjson_get_string(item, "dotfile");
-        if (dotfile) {
-            e->dotfile = strdup(dotfile);
-        }
-        const char *package = sjson_get_string(item, "package");
-        if (package) {
-            e->package = strdup(package);
-        }
-        const char *group = sjson_get_string(item, "group");
-        if (group) {
-            e->group = strdup(group);
-        }
-
-        const struct sjson_value *classes = sjson_get(item, "classes");
-        if (classes && classes->type == SJSON_ARRAY) {
-            size_t ccount = sjson_array_len(classes);
-            if (ccount > 0) {
-                e->classes = (char **)calloc(ccount, sizeof(char *));
-                if (e->classes) {
-                    e->class_count = ccount;
-                    for (size_t j = 0; j < ccount; j++) {
-                        const struct sjson_value *cv = sjson_array_at(classes, j);
-                        if (cv && cv->type == SJSON_STRING) {
-                            e->classes[j] = strdup(cv->u.str_val);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    sjson_free(&root);
     out->entries = entries;
     out->count = count;
     return 0;
 }
 
 void appmap_free(struct appmap *map) {
-    if (!map || !map->entries) {
-        return;
-    }
+    if (!map || !map->entries) return;
     for (size_t i = 0; i < map->count; i++) {
         free_entry(&map->entries[i]);
     }
     free(map->entries);
     map->entries = NULL;
     map->count = 0;
-}
-
-const struct appmap_entry *appmap_find_by_class(const struct appmap *map, const char *class_name) {
-    if (!map || !class_name) return NULL;
-    for (size_t i = 0; i < map->count; i++) {
-        for (size_t j = 0; j < map->entries[i].class_count; j++) {
-            if (map->entries[i].classes[j] && 
-                strcasecmp(map->entries[i].classes[j], class_name) == 0) {
-                return &map->entries[i];
-            }
-        }
-    }
-    return NULL;
 }

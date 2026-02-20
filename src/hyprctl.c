@@ -1,58 +1,120 @@
 #include "hyprctl.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "simplejson.h"
+/*
+ * Simple JSON string extraction for hyprctl -j clients output.
+ * We know the exact structure: an array of objects with known keys.
+ * No need for a full parser.
+ */
 
 static char *read_pipe(const char *cmd, size_t *out_len) {
     FILE *fp = popen(cmd, "r");
-    if (!fp) {
-        return NULL;
-    }
-    size_t cap = 4096;
-    size_t len = 0;
-    char *buf = (char *)malloc(cap);
-    if (!buf) {
-        pclose(fp);
-        return NULL;
-    }
+    if (!fp) return NULL;
 
-    size_t nread = 0;
-    while (!feof(fp)) {
+    size_t cap = 4096, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { pclose(fp); return NULL; }
+
+    size_t nread;
+    while ((nread = fread(buf + len, 1, 1024, fp)) > 0) {
+        len += nread;
         if (len + 1024 > cap) {
             cap *= 2;
-            char *next = (char *)realloc(buf, cap);
-            if (!next) {
-                free(buf);
-                pclose(fp);
-                return NULL;
-            }
+            char *next = realloc(buf, cap);
+            if (!next) { free(buf); pclose(fp); return NULL; }
             buf = next;
         }
-        nread = fread(buf + len, 1, 1024, fp);
-        len += nread;
     }
 
-    int rc = pclose(fp);
-    if (rc != 0) {
-        free(buf);
-        return NULL;
-    }
-
-    buf = (char *)realloc(buf, len + 1);
+    if (pclose(fp) != 0) { free(buf); return NULL; }
     buf[len] = '\0';
-    if (out_len) {
-        *out_len = len;
-    }
+    if (out_len) *out_len = len;
     return buf;
 }
 
-static void free_client(struct client *c) {
-    if (!c) {
-        return;
+/* find "key": "value" in buf starting at pos, return strdup'd value */
+static char *json_get_str(const char *buf, size_t len, size_t start, const char *key) {
+    /* build search pattern: "key": " */
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    size_t patlen = strlen(pat);
+
+    const char *p = buf + start;
+    const char *end = buf + len;
+
+    while (p < end) {
+        p = strstr(p, pat);
+        if (!p || p >= end) return NULL;
+        p += patlen;
+
+        /* skip whitespace */
+        while (p < end && isspace((unsigned char)*p)) p++;
+        if (p >= end || *p != '"') return NULL;
+        p++; /* skip opening quote */
+
+        /* find closing quote, handling escapes */
+        const char *val_start = p;
+        while (p < end && *p != '"') {
+            if (*p == '\\' && p + 1 < end) p++;
+            p++;
+        }
+        if (p >= end) return NULL;
+
+        size_t vlen = (size_t)(p - val_start);
+        char *result = malloc(vlen + 1);
+        if (!result) return NULL;
+        memcpy(result, val_start, vlen);
+        result[vlen] = '\0';
+        return result;
     }
+    return NULL;
+}
+
+/* find "key": <number> in buf starting at pos */
+static int json_get_int(const char *buf, size_t len, size_t start, const char *key, int def) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+
+    const char *p = strstr(buf + start, pat);
+    if (!p || p >= buf + len) return def;
+    p += strlen(pat);
+
+    while (p < buf + len && isspace((unsigned char)*p)) p++;
+    if (p >= buf + len) return def;
+
+    char *end_ptr = NULL;
+    long val = strtol(p, &end_ptr, 10);
+    if (end_ptr == p) return def;
+    return (int)val;
+}
+
+/* find the end of a JSON object starting at '{' */
+static size_t json_skip_object(const char *buf, size_t len, size_t pos) {
+    if (pos >= len || buf[pos] != '{') return pos;
+    int depth = 1;
+    pos++;
+    int in_string = 0;
+    while (pos < len && depth > 0) {
+        char c = buf[pos];
+        if (in_string) {
+            if (c == '\\') { pos++; }
+            else if (c == '"') { in_string = 0; }
+        } else {
+            if (c == '"') in_string = 1;
+            else if (c == '{') depth++;
+            else if (c == '}') depth--;
+        }
+        pos++;
+    }
+    return pos;
+}
+
+static void free_client(struct client *c) {
+    if (!c) return;
     free(c->class_name);
     free(c->title);
     free(c->initial_class);
@@ -65,74 +127,65 @@ int hyprctl_clients(struct clients *out) {
 
     size_t len = 0;
     char *buf = read_pipe("hyprctl -j clients", &len);
-    if (!buf) {
-        return -1;
+    if (!buf) return -1;
+
+    /* count objects by counting top-level '{' */
+    size_t count = 0;
+    int depth = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] == '[') depth++;
+        else if (buf[i] == ']') depth--;
+        else if (buf[i] == '{' && depth == 1) count++;
     }
 
-    struct sjson_value root;
-    if (sjson_parse(buf, len, &root) != 0) {
-        free(buf);
-        return -1;
-    }
-    free(buf);
+    if (count == 0) { free(buf); return 0; }
 
-    if (root.type != SJSON_ARRAY) {
-        sjson_free(&root);
-        return -1;
-    }
+    struct client *items = calloc(count, sizeof(struct client));
+    if (!items) { free(buf); return -1; }
 
-    size_t count = sjson_array_len(&root);
-    struct client *items = (struct client *)calloc(count, sizeof(struct client));
-    if (!items) {
-        sjson_free(&root);
-        return -1;
-    }
+    /* parse each top-level object */
+    size_t idx = 0;
+    size_t pos = 0;
+    while (pos < len && idx < count) {
+        /* find next '{' at depth 1 */
+        while (pos < len && buf[pos] != '{') pos++;
+        if (pos >= len) break;
 
-    for (size_t i = 0; i < count; i++) {
-        const struct sjson_value *item = sjson_array_at(&root, i);
-        if (!item || item->type != SJSON_OBJECT) {
-            continue;
-        }
-        struct client *c = &items[i];
+        size_t obj_start = pos;
+        size_t obj_end = json_skip_object(buf, len, pos);
 
-        const char *cls = sjson_get_string(item, "class");
-        if (cls) {
-            c->class_name = strdup(cls);
-        }
-        const char *title = sjson_get_string(item, "title");
-        if (title) {
-            c->title = strdup(title);
-        }
-        const char *ic = sjson_get_string(item, "initialClass");
-        if (ic) {
-            c->initial_class = strdup(ic);
-        }
-        const char *it = sjson_get_string(item, "initialTitle");
-        if (it) {
-            c->initial_title = strdup(it);
-        }
+        struct client *c = &items[idx];
+        c->class_name = json_get_str(buf, obj_end, obj_start, "class");
+        c->title = json_get_str(buf, obj_end, obj_start, "title");
+        c->initial_class = json_get_str(buf, obj_end, obj_start, "initialClass");
+        c->initial_title = json_get_str(buf, obj_end, obj_start, "initialTitle");
 
+        /* workspace is a nested object: "workspace": { "id": N, "name": "..." } */
         c->workspace_id = -1;
-        const struct sjson_value *ws = sjson_get(item, "workspace");
-        if (ws && ws->type == SJSON_OBJECT) {
-            c->workspace_id = sjson_get_int(ws, "id", -1);
-            const char *wsname = sjson_get_string(ws, "name");
-            if (wsname) {
-                c->workspace_name = strdup(wsname);
+        char pat[] = "\"workspace\":";
+        const char *ws = strstr(buf + obj_start, pat);
+        if (ws && ws < buf + obj_end) {
+            const char *brace = strchr(ws + sizeof(pat) - 1, '{');
+            if (brace && brace < buf + obj_end) {
+                size_t ws_start = (size_t)(brace - buf);
+                size_t ws_end = json_skip_object(buf, obj_end, ws_start);
+                c->workspace_id = json_get_int(buf, ws_end, ws_start, "id", -1);
+                c->workspace_name = json_get_str(buf, ws_end, ws_start, "name");
             }
         }
+
+        idx++;
+        pos = obj_end;
     }
 
-    sjson_free(&root);
+    free(buf);
     out->items = items;
     out->count = count;
     return 0;
 }
 
 void clients_free(struct clients *list) {
-    if (!list || !list->items) {
-        return;
-    }
+    if (!list || !list->items) return;
     for (size_t i = 0; i < list->count; i++) {
         free_client(&list->items[i]);
     }

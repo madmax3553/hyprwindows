@@ -6,7 +6,6 @@
 #include <string.h>
 
 #include "util.h"
-#include "vec.h"
 
 static char *strip_comments(const char *src, size_t len, size_t *out_len) {
     char *out = (char *)malloc(len + 1);

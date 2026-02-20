@@ -75,22 +75,6 @@ void str_to_lower_inplace(char *s) {
     }
 }
 
-char *str_to_lower(const char *s) {
-    if (!s) {
-        return NULL;
-    }
-    size_t len = strlen(s);
-    char *out = (char *)malloc(len + 1);
-    if (!out) {
-        return NULL;
-    }
-    for (size_t i = 0; i < len; i++) {
-        out[i] = (char)tolower((unsigned char)s[i]);
-    }
-    out[len] = '\0';
-    return out;
-}
-
 /* --- file I/O --- */
 
 char *read_file(const char *path, size_t *out_len) {

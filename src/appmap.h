@@ -4,11 +4,11 @@
 #include <stddef.h>
 
 struct appmap_entry {
-    char *dotfile;      /* config dir name (e.g., "firefox") */
-    char *package;      /* package name if different (e.g., "firefox-developer-edition") */
-    char **classes;     /* window class names */
+    char *dotfile;
+    char *package;
+    char **classes;
     size_t class_count;
-    char *group;        /* category (e.g., "browser") */
+    char *group;
 };
 
 struct appmap {
@@ -18,6 +18,5 @@ struct appmap {
 
 int appmap_load(const char *path, struct appmap *out);
 void appmap_free(struct appmap *map);
-const struct appmap_entry *appmap_find_by_class(const struct appmap *map, const char *class_name);
 
 #endif
