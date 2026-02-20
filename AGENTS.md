@@ -1,78 +1,97 @@
 # Agent Guidelines for hyprwindows
 
-This document outlines essential information for agents working on the `hyprwindows` codebase.
-
 ## Project Overview
 
-`hyprwindows` is a C project designed to manage window properties based on user-defined rules, primarily interacting with the Hyprland window manager. It features a command-line interface (CLI) and a Terminal User Interface (TUI). JSON files are used for defining rules and application mappings.
+`hyprwindows` is a small C utility for managing Hyprland window rules. It provides a TUI (ncurses) for viewing, editing, and saving window rules defined in Hyprland config format. It can also check active windows against rules and find missing rules via an appmap.
 
-## Essential Commands
+**Philosophy:** This is a simple utility — don't over-engineer it. The codebase was recently stripped from ~4,600 lines down to ~2,100 lines of C. Keep it lean.
 
-The project uses `make` for building.
+## Build
 
--   **Build**:
-    ```bash
-    make
-    ```
-    Compiles the source code and creates the `hyprwindows` executable.
--   **Clean**:
-    ```bash
-    make clean
-    ```
-    Removes compiled object files and the `hyprwindows` executable.
--   **Run TUI (Default)**:
-    ```bash
-    ./hyprwindows
-    ```
-    Runs the Terminal User Interface (TUI).
--   **Run TUI (Explicit)**:
-    ```bash
-    ./hyprwindows --tui
-    ```
-    Explicitly runs the Terminal User Interface (TUI).
--   **Summarize Rules**:
-    ```bash
-    ./hyprwindows summarize <rules.json|jsonc>
-    ```
-    Loads and summarizes the defined rules from a JSON file.
--   **Scan Dotfiles**:
-    ```bash
-    ./hyprwindows scan-dotfiles <dotfiles_dir> <rules.json|jsonc> [appmap.json]
-    ```
-    Scans a specified dotfiles directory and a rules file. It identifies applications with missing rules or overlapping rules, optionally using an `appmap.json` for application mapping.
--   **Active Windows**:
-    ```bash
-    ./hyprwindows active <rules.json|jsonc>
-    ```
-    Lists active windows and checks which rules apply to them. It can also suggest new rules based on the active windows.
+Unity build — the entire project compiles as a single translation unit:
 
-## Code Organization and Structure
+```bash
+make            # builds ./hyprwindows
+make clean      # removes the binary
+make debug      # builds with -g -O0 -DDEBUG
+```
 
--   `src/`: Contains the core C source (`.c`) and header (`.h`) files for the application logic.
--   `third_party/`: Houses external dependencies, such as `jsmn.c` and `jsmn.h` for JSON parsing.
--   `data/`: Stores data files, currently including `appmap.json`.
--   The codebase follows a modular design, with header files defining data structures and function prototypes, and corresponding C files providing their implementations.
--   Custom data structures like `str_list` (dynamic array of strings) and `group_list` (dynamic array of `group_entry` structs) are used for internal data management.
--   An `outbuf` utility is implemented for efficient dynamic string output.
+The build is just: `cc -Wall -Wextra -Werror -O2 -o hyprwindows unity.c -lncurses`
 
-## Naming Conventions and Style Patterns
+## Usage
 
--   **Files**: Lowercase with `.c` and `.h` extensions (e.g., `main.c`, `rules.h`).
--   **Functions and Variables**: `snake_case` (e.g., `run_tui`, `ruleset_load_json`).
--   **Macros**: `CAPITAL_SNAKE_CASE`.
--   **Structures**: `struct name_of_struct`.
--   **Internal Functions**: Functions intended for internal use within a `.c` file are typically declared `static`.
--   **Memory Management**: Manual memory management using `malloc`, `realloc`, and `free` is consistently applied.
+```bash
+./hyprwindows          # Launch TUI (default)
+./hyprwindows --tui    # Launch TUI (explicit)
+./hyprwindows --help   # Show help
+```
 
-## Testing Approach and Patterns
+There is no CLI mode — all interaction is through the TUI.
 
--   No formal unit testing framework or dedicated test suite was observed.
--   Functional testing is primarily performed by executing the `hyprwindows` executable with various command-line arguments and observing the output.
+## File Structure
 
-## Important Gotchas or Non-Obvious Patterns
+```
+unity.c              # Unity build entry — #includes all src/*.c files
+Makefile             # Single-target build
+data/appmap.json     # App-to-window-class mapping (379 lines)
+src/
+  main.c       (31 lines)   Entry point, arg parsing
+  util.c/h     (152 lines)  regex_match, read_file, expand_home, regex cache
+  rules.c/h    (256 lines)  Rule data model, load/save, rule_write, rule_copy
+  hyprconf.c/h (329 lines)  Hyprland config file parser (windowrule blocks)
+  hyprctl.c/h  (218 lines)  IPC with hyprctl — reads active window list
+  appmap.c/h   (209 lines)  Parses appmap.json (inline string extraction, no JSON lib)
+  history.c/h  (126 lines)  Undo/redo stack for rule edits
+  actions.c/h  (308 lines)  outbuf, rule_matches_client, review_rules, find_missing_rules
+  ui.c/h       (1654 lines) ncurses TUI — rules view, windows view, review view
+```
 
--   **Memory Management**: Due to manual memory management, it is crucial to ensure that all dynamically allocated memory is correctly freed to prevent memory leaks. Pay close attention to `_free` functions associated with data structures (e.g., `ruleset_free`, `list_free`).
--   **JSON Parsing**: The project uses the `jsmn` library for JSON parsing. Understanding its token-based approach is important when modifying or extending JSON-related logic.
--   **Rule Matching**: Rules are defined using regular expressions for `class`, `title`, `initialClass`, `initialTitle`, and `tag` fields. When constructing or modifying rule matching logic, be aware of regex syntax and potential need for escaping special characters (handled by `escape_regex` in suggestions).
--   **Hyprland Interaction**: The `hyprctl.c` and `hyprctl.h` files are responsible for communicating with the Hyprland window manager. Changes related to window management should be carefully considered in this context.
--   **Error Handling**: Errors are typically propagated via integer return codes (-1 for failure, 0 for success) and error messages are printed to `stderr` or written to the `outbuf`.
+Total: ~2,100 lines of C across 9 .c files, 8 .h files.
+
+## Architecture
+
+All source files are compiled as one translation unit via `unity.c`. There are no external dependencies beyond libc and ncurses. JSON parsing (for hyprctl output and appmap.json) is done with inline string extraction — no JSON library.
+
+**Dependency flow:**
+```
+main.c → ui.c → actions.c → { rules.c, hyprctl.c, appmap.c, history.c }
+                             rules.c → hyprconf.c
+                             everything → util.c
+```
+
+## Key Data Structures
+
+- `struct rule` / `struct ruleset` — window rule with match patterns (regex) and actions (workspace, tag, float, etc.)
+- `struct client` / `struct clients` — active Hyprland windows from `hyprctl clients -j`
+- `struct appmap` / `struct appmap_entry` — maps dotfile/package names to window class names
+- `struct history_stack` / `struct change_record` — undo/redo with full rule snapshots
+- `struct outbuf` — growable string buffer for text output
+
+## Key APIs
+
+- `ruleset_load(path, &ruleset)` — loads rules from hyprland config file
+- `rule_write(FILE*, rule)` — writes a rule back in hyprland format
+- `hyprctl_clients(&clients)` — gets active windows via hyprctl IPC
+- `rule_matches_client(rule, client)` — regex matching of rule against window
+- `history_record(stack, index, old, new, description)` — record a change
+- `history_undo(stack, &out_index)` / `history_redo(stack, &out_index)` — returns restored rule
+- `run_tui()` — launches the ncurses TUI
+
+## Conventions
+
+- **Naming:** `snake_case` for everything. `UPPER_SNAKE` for macros.
+- **Structs:** `struct name`, never typedef'd.
+- **Static:** Internal functions are `static`. All static names are unique across files (required for unity build).
+- **Memory:** Manual malloc/free. Every struct with allocations has a corresponding `_free` function.
+- **Errors:** Return 0 for success, -1 for failure. Errors go to stderr or outbuf.
+
+## Gotchas
+
+- **Unity build:** All .c files share one translation unit. Static function/variable names must be globally unique across all files. Currently no conflicts exist.
+- **No JSON library:** hyprctl.c and appmap.c parse JSON with simple string scanning. This works because the JSON structures are predictable with known keys. Don't try to generalize it.
+- **Regex caching:** util.c maintains a 64-entry compiled regex cache (`regex_cache`). Regexes are compiled once and reused.
+- **Rule format:** Rules are in Hyprland's `windowrule { ... }` block format, not JSON. The parser is in hyprconf.c.
+
+## Next Steps (Planned)
+
+- Replace ncurses TUI with Clay + Raylib for the UI layer
