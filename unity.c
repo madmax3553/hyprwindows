@@ -1,0 +1,10 @@
+/* Unity build — single translation unit for hyprwindows */
+#include "src/util.c"
+#include "src/rules.c"
+#include "src/hyprconf.c"
+#include "src/hyprctl.c"
+#include "src/appmap.c"
+#include "src/history.c"
+#include "src/actions.c"
+#include "src/ui.c"
+#include "src/main.c"

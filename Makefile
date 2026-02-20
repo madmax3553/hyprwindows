@@ -1,4 +1,4 @@
-CC ?= clang
+CC ?= cc
 CFLAGS ?= -Wall -Wextra -Werror -O2
 LDLIBS ?= -lncurses
 
@@ -6,25 +6,12 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 MANDIR ?= $(PREFIX)/share/man/man1
 
-SRC = \
-	src/main.c \
-	src/rules.c \
-	src/hyprctl.c \
-	src/util.c \
-	src/appmap.c \
-	src/actions.c \
-	src/ui.c \
-	src/hyprconf.c \
-	src/history.c
-
-OBJ = $(SRC:.c=.o)
-
 BIN = hyprwindows
 
 all: $(BIN)
 
-$(BIN): $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDLIBS)
+$(BIN): unity.c src/*.c src/*.h
+	$(CC) $(CFLAGS) -o $@ unity.c $(LDLIBS)
 
 debug: CFLAGS = -Wall -Wextra -g -O0 -DDEBUG
 debug: clean $(BIN)
@@ -40,6 +27,6 @@ uninstall:
 	rm -f $(DESTDIR)$(MANDIR)/hyprwindows.1
 
 clean:
-	rm -f $(OBJ) $(BIN)
+	rm -f $(BIN)
 
 .PHONY: all debug install uninstall clean
