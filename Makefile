@@ -1,6 +1,6 @@
 CC ?= cc
-CFLAGS ?= -Wall -Wextra -Werror -O2
-LDLIBS ?= -lncurses
+CFLAGS ?= -Wall -Wextra -Werror -O2 $(shell pkg-config --cflags notcurses-core)
+LDLIBS ?= $(shell pkg-config --libs notcurses-core)
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
@@ -13,7 +13,7 @@ all: $(BIN)
 $(BIN): unity.c src/*.c src/*.h
 	$(CC) $(CFLAGS) -o $@ unity.c $(LDLIBS)
 
-debug: CFLAGS = -Wall -Wextra -g -O0 -DDEBUG
+debug: CFLAGS = -Wall -Wextra -g -O0 -DDEBUG $(shell pkg-config --cflags notcurses-core)
 debug: clean $(BIN)
 
 install: $(BIN)

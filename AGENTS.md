@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-`hyprwindows` is a small C utility for managing Hyprland window rules. It provides a TUI (ncurses) for viewing, editing, and saving window rules defined in Hyprland config format. It can also check active windows against rules and find missing rules via an appmap.
+`hyprwindows` is a small C utility for managing Hyprland window rules. It provides a TUI (notcurses) for viewing, editing, and saving window rules defined in Hyprland config format. It can also check active windows against rules and find missing rules via an appmap.
 
-**Philosophy:** This is a simple utility — don't over-engineer it. The codebase was recently stripped from ~4,600 lines down to ~2,100 lines of C. Keep it lean.
+**Philosophy:** This is a simple utility — don't over-engineer it. The codebase was recently stripped from ~4,600 lines down to ~2,100 lines of C (now ~2,500 after the notcurses TUI rewrite and improvements). Keep it lean.
 
 ## Build
 
@@ -16,7 +16,7 @@ make clean      # removes the binary
 make debug      # builds with -g -O0 -DDEBUG
 ```
 
-The build is just: `cc -Wall -Wextra -Werror -O2 -o hyprwindows unity.c -lncurses`
+The build is just: `cc -Wall -Wextra -Werror -O2 $(pkg-config --cflags notcurses-core) -o hyprwindows unity.c $(pkg-config --libs notcurses-core)`
 
 ## Usage
 
@@ -36,21 +36,21 @@ Makefile             # Single-target build
 data/appmap.json     # App-to-window-class mapping (379 lines)
 src/
   main.c       (31 lines)   Entry point, arg parsing
-  util.c/h     (152 lines)  regex_match, read_file, expand_home, regex cache
-  rules.c/h    (256 lines)  Rule data model, load/save, rule_write, rule_copy
-  hyprconf.c/h (329 lines)  Hyprland config file parser (windowrule blocks)
-  hyprctl.c/h  (218 lines)  IPC with hyprctl — reads active window list
-  appmap.c/h   (209 lines)  Parses appmap.json (inline string extraction, no JSON lib)
-  history.c/h  (126 lines)  Undo/redo stack for rule edits
-  actions.c/h  (308 lines)  outbuf, rule_matches_client, review_rules, find_missing_rules
-  ui.c/h       (1654 lines) ncurses TUI — rules view, windows view, review view
+  util.c/h     (136 lines)  regex_match, read_file, expand_home, regex cache
+  rules.c/h    (197 lines)  Rule data model, load/save, rule_write, rule_copy
+  hyprconf.c/h (321 lines)  Hyprland config file parser (windowrule blocks)
+  hyprctl.c/h  (195 lines)  IPC with hyprctl — reads active window list
+  appmap.c/h   (187 lines)  Parses appmap.json (inline string extraction, no JSON lib)
+  history.c/h  (92 lines)   Undo/redo stack for rule edits
+  actions.c/h  (269 lines)  outbuf, rule_matches_client, review_rules, find_missing_rules
+  ui.c/h       (2143 lines) notcurses TUI — rules view, windows view, review view, modals
 ```
 
-Total: ~2,100 lines of C across 9 .c files, 8 .h files.
+Total: ~2,500 lines of C across 9 .c files, 8 .h files.
 
 ## Architecture
 
-All source files are compiled as one translation unit via `unity.c`. There are no external dependencies beyond libc and ncurses. JSON parsing (for hyprctl output and appmap.json) is done with inline string extraction — no JSON library.
+All source files are compiled as one translation unit via `unity.c`. There are no external dependencies beyond libc and notcurses-core. JSON parsing (for hyprctl output and appmap.json) is done with inline string extraction — no JSON library.
 
 **Dependency flow:**
 ```
@@ -75,7 +75,7 @@ main.c → ui.c → actions.c → { rules.c, hyprctl.c, appmap.c, history.c }
 - `rule_matches_client(rule, client)` — regex matching of rule against window
 - `history_record(stack, index, old, new, description)` — record a change
 - `history_undo(stack, &out_index)` / `history_redo(stack, &out_index)` — returns restored rule
-- `run_tui()` — launches the ncurses TUI
+- `run_tui()` — launches the notcurses TUI
 
 ## Conventions
 
@@ -94,4 +94,5 @@ main.c → ui.c → actions.c → { rules.c, hyprctl.c, appmap.c, history.c }
 
 ## Next Steps (Planned)
 
-- Replace ncurses TUI with Clay + Raylib for the UI layer
+- Make window detail popup interactive (navigate to matching rules, jump to rules view)
+- Apply same compact table + detail popup pattern to the review tab
