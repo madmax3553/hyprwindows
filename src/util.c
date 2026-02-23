@@ -41,7 +41,7 @@ static regex_t *cache_put(const char *pattern) {
         e->valid = 0;
     }
 
-    int rc = regcomp(&e->compiled, pattern, REG_EXTENDED | REG_NOSUB);
+    int rc = regcomp(&e->compiled, pattern, REG_EXTENDED | REG_NOSUB | REG_ICASE);
     if (rc != 0) {
         return NULL;
     }

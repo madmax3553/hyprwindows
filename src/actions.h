@@ -29,7 +29,6 @@ void outbuf_init(struct outbuf *out);
 void outbuf_free(struct outbuf *out);
 int outbuf_printf(struct outbuf *out, const char *fmt, ...);
 
-int review_rules_text(const char *rules_path, struct outbuf *out);
 int rule_matches_client(const struct rule *r, const struct client *c);
 
 int find_missing_rules(const char *rules_path, const char *appmap_path,

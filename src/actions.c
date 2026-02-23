@@ -79,73 +79,10 @@ int rule_matches_client(const struct rule *r, const struct client *c) {
             return 0;
         }
     }
-    if (r->match.tag_re) {
-        if (!c->workspace_name || !regex_match(r->match.tag_re, c->workspace_name)) {
-            return 0;
-        }
-    }
+    /* tag matching skipped — hyprctl doesn't expose window tags,
+       so we can't check match:tag; treat it as always matching
+       to avoid falsely marking rules as unused */
     return 1;
-}
-
-int review_rules_text(const char *rules_path, struct outbuf *out) {
-    struct ruleset rules;
-    if (ruleset_load(rules_path, &rules) != 0) {
-        outbuf_printf(out, "Failed to load rules from %s\n", rules_path);
-        return -1;
-    }
-    struct clients clients;
-    if (hyprctl_clients(&clients) != 0) {
-        outbuf_printf(out, "Failed to read hyprctl clients\n");
-        ruleset_free(&rules);
-        return -1;
-    }
-
-    int *matched = calloc(rules.count, sizeof(int));
-    if (!matched) {
-        clients_free(&clients);
-        ruleset_free(&rules);
-        return -1;
-    }
-
-    int windows_without_rules = 0;
-    for (size_t i = 0; i < clients.count; i++) {
-        struct client *c = &clients.items[i];
-        int has_match = 0;
-        for (size_t r = 0; r < rules.count; r++) {
-            if (rule_matches_client(&rules.rules[r], c)) {
-                matched[r] = 1;
-                has_match = 1;
-            }
-        }
-        if (!has_match) windows_without_rules++;
-    }
-
-    int unused_count = 0;
-    outbuf_printf(out, "=== Rules Review ===\n\n");
-    outbuf_printf(out, "Potentially unused rules (no matching windows):\n");
-    for (size_t r = 0; r < rules.count; r++) {
-        if (!matched[r]) {
-            struct rule *rule = &rules.rules[r];
-            const char *name = rule->name ? rule->name : "(unnamed)";
-            const char *class_re = rule->match.class_re ? rule->match.class_re : "-";
-            outbuf_printf(out, "  %s: %s\n", name, class_re);
-            unused_count++;
-        }
-    }
-    if (unused_count == 0) {
-        outbuf_printf(out, "  (none - all rules match at least one window)\n");
-    }
-
-    outbuf_printf(out, "\nSummary:\n");
-    outbuf_printf(out, "  Total rules: %zu\n", rules.count);
-    outbuf_printf(out, "  Active rules: %zu\n", rules.count - unused_count);
-    outbuf_printf(out, "  Unused rules: %d\n", unused_count);
-    outbuf_printf(out, "  Windows without rules: %d\n", windows_without_rules);
-
-    free(matched);
-    clients_free(&clients);
-    ruleset_free(&rules);
-    return 0;
 }
 
 /* check if any rule matches a class pattern (simple substring check) */

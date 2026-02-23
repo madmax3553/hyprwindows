@@ -1,6 +1,6 @@
 CC ?= cc
 CFLAGS ?= -Wall -Wextra -Werror -O2 $(shell pkg-config --cflags notcurses-core)
-LDLIBS ?= $(shell pkg-config --libs notcurses-core)
+LDLIBS ?= $(shell pkg-config --libs notcurses-core) -lpthread
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin

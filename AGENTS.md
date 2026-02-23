@@ -4,7 +4,7 @@
 
 `hyprwindows` is a small C utility for managing Hyprland window rules. It provides a TUI (notcurses) for viewing, editing, and saving window rules defined in Hyprland config format. It can also check active windows against rules and find missing rules via an appmap.
 
-**Philosophy:** This is a simple utility — don't over-engineer it. The codebase was recently stripped from ~4,600 lines down to ~2,100 lines of C (now ~2,500 after the notcurses TUI rewrite and improvements). Keep it lean.
+**Philosophy:** This is a simple utility — don't over-engineer it. The codebase was recently stripped from ~4,600 lines down to ~2,100 lines of C (now ~2,700 after the notcurses TUI rewrite, interactive popups, and review table). Keep it lean.
 
 ## Build
 
@@ -42,11 +42,11 @@ src/
   hyprctl.c/h  (195 lines)  IPC with hyprctl — reads active window list
   appmap.c/h   (187 lines)  Parses appmap.json (inline string extraction, no JSON lib)
   history.c/h  (92 lines)   Undo/redo stack for rule edits
-  actions.c/h  (269 lines)  outbuf, rule_matches_client, review_rules, find_missing_rules
-  ui.c/h       (2143 lines) notcurses TUI — rules view, windows view, review view, modals
+  actions.c/h  (208 lines)  outbuf, rule_matches_client, find_missing_rules
+  ui.c/h       (2578 lines) notcurses TUI — rules view, windows view, review view, modals, sort
 ```
 
-Total: ~2,500 lines of C across 9 .c files, 8 .h files.
+Total: ~2,800 lines of C across 9 .c files, 8 .h files.
 
 ## Architecture
 
@@ -94,5 +94,5 @@ main.c → ui.c → actions.c → { rules.c, hyprctl.c, appmap.c, history.c }
 
 ## Next Steps (Planned)
 
-- Make window detail popup interactive (navigate to matching rules, jump to rules view)
-- Apply same compact table + detail popup pattern to the review tab
+- Add ability to create new rules from the missing rules popup (pre-fill class pattern from appmap)
+- Bulk actions on review items (e.g., dismiss unused warnings, batch-add missing rules)

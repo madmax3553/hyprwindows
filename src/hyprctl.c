@@ -129,13 +129,21 @@ int hyprctl_clients(struct clients *out) {
     char *buf = read_pipe("hyprctl -j clients", &len);
     if (!buf) return -1;
 
-    /* count objects by counting top-level '{' */
+    /* count top-level objects (must skip strings to avoid false '{' in values) */
     size_t count = 0;
     int depth = 0;
+    int in_str = 0;
     for (size_t i = 0; i < len; i++) {
-        if (buf[i] == '[') depth++;
-        else if (buf[i] == ']') depth--;
-        else if (buf[i] == '{' && depth == 1) count++;
+        char c = buf[i];
+        if (in_str) {
+            if (c == '\\') i++;        /* skip escaped char */
+            else if (c == '"') in_str = 0;
+        } else {
+            if (c == '"') in_str = 1;
+            else if (c == '[') depth++;
+            else if (c == ']') depth--;
+            else if (c == '{' && depth == 1) count++;
+        }
     }
 
     if (count == 0) { free(buf); return 0; }
@@ -180,7 +188,7 @@ int hyprctl_clients(struct clients *out) {
 
     free(buf);
     out->items = items;
-    out->count = count;
+    out->count = idx;
     return 0;
 }
 
