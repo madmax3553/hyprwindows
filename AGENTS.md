@@ -4,7 +4,7 @@
 
 `hyprwindows` is a small C utility for managing Hyprland window rules. It provides a TUI (notcurses) for viewing, editing, and saving window rules defined in Hyprland config format. It can also check active windows against rules and find missing rules via an appmap.
 
-**Philosophy:** This is a simple utility — don't over-engineer it. The codebase was recently stripped from ~4,600 lines down to ~2,100 lines of C (now ~2,700 after the notcurses TUI rewrite, interactive popups, and review table). Keep it lean.
+**Philosophy:** This is a simple utility — don't over-engineer it. Keep it lean.
 
 ## Build
 
@@ -33,20 +33,20 @@ There is no CLI mode — all interaction is through the TUI.
 ```
 unity.c              # Unity build entry — #includes all src/*.c files
 Makefile             # Single-target build
-data/appmap.json     # App-to-window-class mapping (379 lines)
+data/appmap.json     # App-to-window-class mapping (378 lines)
 src/
   main.c       (31 lines)   Entry point, arg parsing
   util.c/h     (136 lines)  regex_match, read_file, expand_home, regex cache
   rules.c/h    (197 lines)  Rule data model, load/save, rule_write, rule_copy
   hyprconf.c/h (321 lines)  Hyprland config file parser (windowrule blocks)
-  hyprctl.c/h  (195 lines)  IPC with hyprctl — reads active window list
+  hyprctl.c/h  (203 lines)  IPC with hyprctl — reads active window list
   appmap.c/h   (187 lines)  Parses appmap.json (inline string extraction, no JSON lib)
-  history.c/h  (92 lines)   Undo/redo stack for rule edits
-  actions.c/h  (208 lines)  outbuf, rule_matches_client, find_missing_rules
-  ui.c/h       (2578 lines) notcurses TUI — rules view, windows view, review view, modals, sort
+  history.c/h  (99 lines)   Undo/redo stack for rule edits (supports edit + delete change types)
+  actions.c/h  (159 lines)  rule_matches_client, find_missing_rules
+  ui.c/h       (3322 lines) notcurses TUI — rules view, windows view, review view, modals, sort
 ```
 
-Total: ~2,800 lines of C across 9 .c files, 8 .h files.
+Total: ~4,655 lines of C across 9 .c files, 8 .h files.
 
 ## Architecture
 
@@ -64,8 +64,7 @@ main.c → ui.c → actions.c → { rules.c, hyprctl.c, appmap.c, history.c }
 - `struct rule` / `struct ruleset` — window rule with match patterns (regex) and actions (workspace, tag, float, etc.)
 - `struct client` / `struct clients` — active Hyprland windows from `hyprctl clients -j`
 - `struct appmap` / `struct appmap_entry` — maps dotfile/package names to window class names
-- `struct history_stack` / `struct change_record` — undo/redo with full rule snapshots
-- `struct outbuf` — growable string buffer for text output
+- `struct history_stack` / `struct change_record` — undo/redo with full rule snapshots, supports `CHANGE_EDIT` and `CHANGE_DELETE` types
 
 ## Key APIs
 
@@ -73,8 +72,8 @@ main.c → ui.c → actions.c → { rules.c, hyprctl.c, appmap.c, history.c }
 - `rule_write(FILE*, rule)` — writes a rule back in hyprland format
 - `hyprctl_clients(&clients)` — gets active windows via hyprctl IPC
 - `rule_matches_client(rule, client)` — regex matching of rule against window
-- `history_record(stack, index, old, new, description)` — record a change
-- `history_undo(stack, &out_index)` / `history_redo(stack, &out_index)` — returns restored rule
+- `history_record(stack, type, index, old, new, description)` — record a change (CHANGE_EDIT or CHANGE_DELETE)
+- `history_undo(stack, &out_index, &out_type)` / `history_redo(...)` — returns restored rule and change type
 - `run_tui()` — launches the notcurses TUI
 
 ## Conventions
@@ -83,7 +82,7 @@ main.c → ui.c → actions.c → { rules.c, hyprctl.c, appmap.c, history.c }
 - **Structs:** `struct name`, never typedef'd.
 - **Static:** Internal functions are `static`. All static names are unique across files (required for unity build).
 - **Memory:** Manual malloc/free. Every struct with allocations has a corresponding `_free` function.
-- **Errors:** Return 0 for success, -1 for failure. Errors go to stderr or outbuf.
+- **Errors:** Return 0 for success, -1 for failure. Errors go to stderr.
 
 ## Gotchas
 
@@ -94,5 +93,34 @@ main.c → ui.c → actions.c → { rules.c, hyprctl.c, appmap.c, history.c }
 
 ## Next Steps (Planned)
 
-- Add ability to create new rules from the missing rules popup (pre-fill class pattern from appmap)
-- Bulk actions on review items (e.g., dismiss unused warnings, batch-add missing rules)
+### Improve visuals and refactor for simplicity and performance
+
+**Visuals (remaining):**
+- Polish color scheme and contrast across all views (especially selected/highlighted rows)
+- Cleaner status bar styling (truncation, key highlighting)
+
+**Done (visuals):**
+- ~~Popup layouts~~ — `popup_center()` / `popup_draw()` extracted for consistent sizing
+- ~~Review view section separation~~ — section headers with `── Unused Rules (N)` / `── Missing Rules (N)` dividers
+- ~~Tab bar~~ — dynamic click boundaries computed from drawn positions
+- ~~Summary line~~ — color-coded unused/missing counts
+
+**Refactor (remaining):**
+- Deduplicate the unused/missing/window detail popup functions — they follow the same pattern
+- Simplify the sort infrastructure (remove global `sort_ctx`, use a wrapper struct)
+
+**Done (refactor):**
+- ~~Extract popup boilerplate~~ — `popup_center()`, `popup_draw()`, `draw_scrollbar()` helpers
+- ~~Parallel array management~~ — `remove_rule_at()`, `insert_rule_at()`, `append_rule()` helpers
+- ~~Delete with history~~ — `delete_rule_with_history()` helper (3 call sites)
+- ~~Dead code removal~~ — `outbuf` struct/functions removed, unreachable default case removed
+- ~~Redundant update_display_name()~~ — removed from `load_rules()` (already called in `compute_rule_status()`)
+- ~~Undo/redo for deletes~~ — fixed with `CHANGE_EDIT`/`CHANGE_DELETE` enum, proper insert/remove on undo/redo
+- ~~file_order shift bug~~ — fixed via `remove_rule_at()` helper
+
+**Performance (remaining):**
+- Consider lazy review data loading only when the review tab is first visited (currently precomputed)
+
+**Done (performance):**
+- ~~Selective rule status recomputation~~ — evaluated, skipped (negligible gain for realistic rule counts, `load_clients` already guarded)
+- ~~Redundant update_display_name()~~ — eliminated duplicate call path

@@ -1,6 +1,5 @@
 #include "actions.h"
 
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,52 +10,6 @@
 #include "hyprctl.h"
 #include "rules.h"
 #include "util.h"
-
-void outbuf_init(struct outbuf *out) {
-    out->data = NULL;
-    out->len = 0;
-    out->cap = 0;
-}
-
-void outbuf_free(struct outbuf *out) {
-    free(out->data);
-    out->data = NULL;
-    out->len = 0;
-    out->cap = 0;
-}
-
-int outbuf_printf(struct outbuf *out, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    va_list args2;
-    va_copy(args2, args);
-    int needed = vsnprintf(NULL, 0, fmt, args);
-    va_end(args);
-    if (needed < 0) {
-        va_end(args2);
-        return -1;
-    }
-
-    size_t add = (size_t)needed;
-    if (out->len + add + 1 > out->cap) {
-        size_t next = out->cap == 0 ? 256 : out->cap;
-        while (out->len + add + 1 > next) {
-            next *= 2;
-        }
-        char *buf = (char *)realloc(out->data, next);
-        if (!buf) {
-            va_end(args2);
-            return -1;
-        }
-        out->data = buf;
-        out->cap = next;
-    }
-
-    vsnprintf(out->data + out->len, out->cap - out->len, fmt, args2);
-    va_end(args2);
-    out->len += add;
-    return 0;
-}
 
 int rule_matches_client(const struct rule *r, const struct client *c) {
     if (r->match.class_re) {

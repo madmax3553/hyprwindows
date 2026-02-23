@@ -10,7 +10,7 @@ void history_init(struct history_stack *h) {
     h->records = calloc(h->capacity, sizeof(struct change_record));
 }
 
-void history_record(struct history_stack *h, int rule_index,
+void history_record(struct history_stack *h, enum change_type type, int rule_index,
                     const struct rule *old_state, const struct rule *new_state,
                     const char *description) {
     if (!h || !h->records) return;
@@ -33,6 +33,7 @@ void history_record(struct history_stack *h, int rule_index,
     }
 
     struct change_record *rec = &h->records[h->count];
+    rec->type = type;
     rec->rule_index = rule_index;
     rec->old_state = rule_copy(old_state);
     rec->new_state = rule_copy(new_state);
@@ -43,13 +44,14 @@ void history_record(struct history_stack *h, int rule_index,
     h->current = h->count;
 }
 
-struct rule *history_undo(struct history_stack *h, int *out_index) {
+struct rule *history_undo(struct history_stack *h, int *out_index, enum change_type *out_type) {
     if (!h || h->current == 0) return NULL;
 
     h->current--;
     struct change_record *rec = &h->records[h->current];
 
     if (out_index) *out_index = rec->rule_index;
+    if (out_type) *out_type = rec->type;
 
     struct rule *restored = malloc(sizeof(struct rule));
     if (restored) {
@@ -58,17 +60,22 @@ struct rule *history_undo(struct history_stack *h, int *out_index) {
     return restored;
 }
 
-struct rule *history_redo(struct history_stack *h, int *out_index) {
+struct rule *history_redo(struct history_stack *h, int *out_index, enum change_type *out_type) {
     if (!h || h->current >= h->count) return NULL;
 
     struct change_record *rec = &h->records[h->current];
     h->current++;
 
     if (out_index) *out_index = rec->rule_index;
+    if (out_type) *out_type = rec->type;
 
+    /* for delete records, return old_state (the deleted rule) so caller knows what was deleted;
+       for edit records, return new_state as before */
     struct rule *restored = malloc(sizeof(struct rule));
     if (restored) {
-        *restored = rule_copy(&rec->new_state);
+        *restored = (rec->type == CHANGE_DELETE)
+                    ? rule_copy(&rec->old_state)
+                    : rule_copy(&rec->new_state);
     }
     return restored;
 }

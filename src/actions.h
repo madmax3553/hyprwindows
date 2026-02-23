@@ -6,12 +6,6 @@
 #include "hyprctl.h"
 #include "rules.h"
 
-struct outbuf {
-    char *data;
-    size_t len;
-    size_t cap;
-};
-
 /* missing rule suggestion */
 struct missing_rule {
     char *app_name;      /* from appmap dotfile/package */
@@ -24,10 +18,6 @@ struct missing_rules {
     struct missing_rule *items;
     size_t count;
 };
-
-void outbuf_init(struct outbuf *out);
-void outbuf_free(struct outbuf *out);
-int outbuf_printf(struct outbuf *out, const char *fmt, ...);
 
 int rule_matches_client(const struct rule *r, const struct client *c);
 

@@ -6,7 +6,10 @@
 
 /* undo/redo history for rule edits */
 
+enum change_type { CHANGE_EDIT, CHANGE_DELETE };
+
 struct change_record {
+    enum change_type type;
     int rule_index;
     struct rule old_state;
     struct rule new_state;
@@ -22,11 +25,11 @@ struct history_stack {
 };
 
 void history_init(struct history_stack *h);
-void history_record(struct history_stack *h, int rule_index,
+void history_record(struct history_stack *h, enum change_type type, int rule_index,
                     const struct rule *old_state, const struct rule *new_state,
                     const char *description);
-struct rule *history_undo(struct history_stack *h, int *out_index);
-struct rule *history_redo(struct history_stack *h, int *out_index);
+struct rule *history_undo(struct history_stack *h, int *out_index, enum change_type *out_type);
+struct rule *history_redo(struct history_stack *h, int *out_index, enum change_type *out_type);
 int history_can_undo(const struct history_stack *h);
 int history_can_redo(const struct history_stack *h);
 void history_free(struct history_stack *h);

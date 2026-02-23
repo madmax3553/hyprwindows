@@ -167,6 +167,81 @@ static void handle_windows_input(ui_state_machine_t *sm, uint32_t id, ncinput *n
 static void handle_review_input(ui_state_machine_t *sm, uint32_t id, ncinput *ni);
 static void handle_actions_input(ui_state_machine_t *sm, uint32_t id, ncinput *ni);
 
+/* --- parallel array helpers --- */
+
+/* remove rule at index, shifting all parallel arrays down */
+static void remove_rule_at(struct ui_state *st, int idx) {
+    rule_free(&st->rules.rules[idx]);
+    for (int i = idx; i < (int)st->rules.count - 1; i++) {
+        st->rules.rules[i] = st->rules.rules[i + 1];
+        if (st->rule_status) st->rule_status[i] = st->rule_status[i + 1];
+        if (st->rule_modified) st->rule_modified[i] = st->rule_modified[i + 1];
+        if (st->file_order) st->file_order[i] = st->file_order[i + 1];
+    }
+    st->rules.count--;
+}
+
+/* insert rule at index, shifting all parallel arrays up; returns 0 on success, -1 on failure */
+static int insert_rule_at(struct ui_state *st, int idx, const struct rule *r) {
+    struct rule *nr = realloc(st->rules.rules, (st->rules.count + 1) * sizeof(struct rule));
+    if (!nr) return -1;
+    st->rules.rules = nr;
+    st->rules.count++;
+
+    /* grow parallel arrays */
+    enum rule_status *ns = realloc(st->rule_status, st->rules.count * sizeof(enum rule_status));
+    if (ns) st->rule_status = ns;
+    int *nm = realloc(st->rule_modified, st->rules.count * sizeof(int));
+    if (nm) st->rule_modified = nm;
+    int *nf = realloc(st->file_order, st->rules.count * sizeof(int));
+    if (nf) st->file_order = nf;
+
+    /* shift elements up from the end */
+    for (int i = (int)st->rules.count - 1; i > idx; i--) {
+        st->rules.rules[i] = st->rules.rules[i - 1];
+        if (st->rule_status) st->rule_status[i] = st->rule_status[i - 1];
+        if (st->rule_modified) st->rule_modified[i] = st->rule_modified[i - 1];
+        if (st->file_order) st->file_order[i] = st->file_order[i - 1];
+    }
+
+    /* place the rule */
+    st->rules.rules[idx] = rule_copy(r);
+    if (st->rule_status) st->rule_status[idx] = RULE_OK;
+    if (st->rule_modified) st->rule_modified[idx] = 1;
+    if (st->file_order) st->file_order[idx] = idx;
+    return 0;
+}
+
+/* grow all parallel arrays by one, returns new index or -1 on failure */
+static int append_rule(struct ui_state *st) {
+    struct rule *nr = realloc(st->rules.rules, (st->rules.count + 1) * sizeof(struct rule));
+    if (!nr) return -1;
+    st->rules.rules = nr;
+    int idx = (int)st->rules.count;
+    memset(&st->rules.rules[idx], 0, sizeof(struct rule));
+    st->rules.count++;
+
+    enum rule_status *ns = realloc(st->rule_status, st->rules.count * sizeof(enum rule_status));
+    if (ns) { st->rule_status = ns; st->rule_status[idx] = RULE_OK; }
+    int *nm = realloc(st->rule_modified, st->rules.count * sizeof(int));
+    if (nm) { st->rule_modified = nm; st->rule_modified[idx] = 0; }
+    int *nf = realloc(st->file_order, st->rules.count * sizeof(int));
+    if (nf) { st->file_order = nf; st->file_order[idx] = idx; }
+    return idx;
+}
+
+/* record history, remove rule, recompute status */
+static void delete_rule_with_history(struct ui_state *st, int idx, const char *desc_prefix) {
+    struct rule copy = rule_copy(&st->rules.rules[idx]);
+    char desc[128];
+    snprintf(desc, sizeof(desc), "%s rule %d", desc_prefix, idx);
+    history_record(&st->history, CHANGE_DELETE, idx, &copy, NULL, desc);
+    rule_free(&copy);
+    remove_rule_at(st, idx);
+    st->modified = 1;
+    compute_rule_status(st);
+}
+
 static void set_status(struct ui_state *st, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -379,9 +454,6 @@ static void load_rules(struct ui_state *st) {
 
     char *path = expand_home(st->rules_path);
     if (ruleset_load(path ? path : st->rules_path, &st->rules) == 0) {
-        for (size_t i = 0; i < st->rules.count; i++) {
-            update_display_name(&st->rules.rules[i]);
-        }
         /* record original file order before sorting */
         st->file_order = malloc(st->rules.count * sizeof(int));
         if (st->file_order) {
@@ -419,6 +491,47 @@ static void draw_box(struct ncplane *n, int y, int x, int h, int w, const char *
     ui_reset_color(n);
 }
 
+struct popup_rect { int y, x, h, w; };
+
+/* Compute centered popup dimensions, clamped to screen with margins */
+static struct popup_rect popup_center(struct ncplane *n, int want_h, int want_w,
+                                       int margin_h, int margin_w) {
+    unsigned scr_h, scr_w;
+    ncplane_dim_yx(n, &scr_h, &scr_w);
+    struct popup_rect r;
+    r.h = want_h;
+    r.w = want_w;
+    if (margin_h > 0 && r.h > (int)scr_h - margin_h) r.h = (int)scr_h - margin_h;
+    if (margin_w > 0 && r.w > (int)scr_w - margin_w) r.w = (int)scr_w - margin_w;
+    r.y = ((int)scr_h - r.h) / 2;
+    r.x = ((int)scr_w - r.w) / 2;
+    return r;
+}
+
+/* Fill popup area and draw box border with title */
+static void popup_draw(struct ncplane *n, struct popup_rect r, const char *title) {
+    for (int i = 0; i < r.h; i++)
+        ui_fill_row(n, r.y + i, r.x, r.w, ' ');
+    draw_box(n, r.y, r.x, r.h, r.w, title);
+}
+
+static void draw_scrollbar(struct ncplane *n, int top_y, int x,
+                            int visible, int total, int scroll) {
+    int thumb = (visible * visible) / total;
+    if (thumb < 1) thumb = 1;
+    int thumb_pos = (visible * scroll) / total;
+    for (int i = 0; i < visible; i++) {
+        if (i >= thumb_pos && i < thumb_pos + thumb) {
+            ui_set_color(n, COL_SELECT);
+            ncplane_putstr_yx(n, top_y + i, x, "\u2588");
+        } else {
+            ui_set_color(n, COL_DIM);
+            ncplane_putstr_yx(n, top_y + i, x, "\u2502");
+        }
+        ui_reset_color(n);
+    }
+}
+
 static void draw_header(struct ncplane *n, unsigned width, const char *title) {
     ui_set_color(n, COL_TITLE);
     ncplane_on_styles(n, NCSTYLE_BOLD);
@@ -437,11 +550,15 @@ static void draw_statusbar(struct ncplane *n, int y, unsigned width, const char 
     ui_reset_color(n);
 }
 
+static int tab_x_start[4], tab_x_end[4]; /* populated by draw_tabs */
+
 static void draw_tabs(struct ncplane *n, int y, unsigned width, enum view_mode mode) {
     (void)width;
     const char *tabs[] = {"[1] Rules", "[2] Windows", "[3] Review", "[4] Actions"};
     int x = 2;
     for (int i = 0; i < 4; i++) {
+        tab_x_start[i] = x;
+        tab_x_end[i] = x + (int)strlen(tabs[i]) + 2; /* " label " = len+2 */
         if (i == (int)mode) {
             ncplane_on_styles(n, NCSTYLE_BOLD);
             ui_set_color(n, COL_SELECT);
@@ -700,23 +817,8 @@ static void draw_rules_view(struct ncplane *n, struct ui_state *st, int y, int h
     }
 
     /* scrollbar */
-    if (max_scroll > 0) {
-        int bar_h = visible;
-        int thumb = (bar_h * visible) / (int)st->rules.count;
-        if (thumb < 1) thumb = 1;
-        int thumb_pos = (bar_h * st->scroll) / (int)st->rules.count;
-
-        for (int i = 0; i < bar_h; i++) {
-            if (i >= thumb_pos && i < thumb_pos + thumb) {
-                ui_set_color(n, COL_SELECT);
-                ncplane_putstr_yx(n, y + 2 + i, w - 1, "\u2588");
-            } else {
-                ui_set_color(n, COL_DIM);
-                ncplane_putstr_yx(n, y + 2 + i, w - 1, "\u2502");
-            }
-            ui_reset_color(n);
-        }
-    }
+    if (max_scroll > 0)
+        draw_scrollbar(n, y + 2, w - 1, visible, (int)st->rules.count, st->scroll);
 }
 
 static void draw_rule_detail(struct ncplane *n, struct ui_state *st, int y, int x, int h, int w) {
@@ -878,29 +980,13 @@ static void draw_windows_view(struct ncplane *n, struct ui_state *st, int y, int
     }
 
     /* scrollbar */
-    if (max_scroll > 0) {
-        int bar_h = visible;
-        int thumb = (bar_h * visible) / (int)st->clients.count;
-        if (thumb < 1) thumb = 1;
-        int thumb_pos = (bar_h * st->scroll) / (int)st->clients.count;
-        for (int i = 0; i < bar_h; i++) {
-            if (i >= thumb_pos && i < thumb_pos + thumb) {
-                ui_set_color(n, COL_SELECT);
-                ncplane_putstr_yx(n, y + 2 + i, w - 1, "\u2588");
-            } else {
-                ui_set_color(n, COL_DIM);
-                ncplane_putstr_yx(n, y + 2 + i, w - 1, "\u2502");
-            }
-            ui_reset_color(n);
-        }
-    }
+    if (max_scroll > 0)
+        draw_scrollbar(n, y + 2, w - 1, visible, (int)st->clients.count, st->scroll);
 }
 
 /* returns rule index to jump to, or -1 if closed without selection */
 static int window_detail_popup(ui_state_machine_t *sm, struct client *c, struct ruleset *rs) {
     struct ncplane *n = sm->std;
-    unsigned scr_h, scr_w;
-    ncplane_dim_yx(n, &scr_h, &scr_w);
 
     /* collect matching rules */
     int matches[256];
@@ -917,23 +1003,15 @@ static int window_detail_popup(ui_state_machine_t *sm, struct client *c, struct 
     if (match_count == 0) content_lines = 6; /* ...+ "(none)" */
     else content_lines = 6 + match_count;
 
-    int h = content_lines + 3; /* box top/bottom + hint line */
-    int w_popup = 60;
-    if (w_popup > (int)scr_w - 4) w_popup = (int)scr_w - 4;
-    if (h > (int)scr_h - 2) h = (int)scr_h - 2;
-    int popup_y = ((int)scr_h - h) / 2;
-    int popup_x = ((int)scr_w - w_popup) / 2;
-    int content_w = w_popup - 4;
+    struct popup_rect p = popup_center(n, content_lines + 3, 60, 2, 4);
+    int content_w = p.w - 4;
 
     while (1) {
-        for (int i = 0; i < h; i++)
-            ui_fill_row(n, popup_y + i, popup_x, w_popup, ' ');
-        draw_box(n, popup_y, popup_x, h, w_popup,
-                 c->class_name ? c->class_name : "Window Details");
+        popup_draw(n, p, c->class_name ? c->class_name : "Window Details");
 
-        int r = popup_y + 2;
-        int lx = popup_x + 2;
-        int vx = popup_x + 18;
+        int r = p.y + 2;
+        int lx = p.x + 2;
+        int vx = p.x + 18;
 
         ui_set_color(n, COL_DIM);
         ncplane_printf_yx(n, r, lx, "Class:");
@@ -974,12 +1052,12 @@ static int window_detail_popup(ui_state_machine_t *sm, struct client *c, struct 
         ui_reset_color(n);
         r++;
 
-        if (match_count == 0 && r < popup_y + h - 1) {
+        if (match_count == 0 && r < p.y + p.h - 1) {
             ui_set_color(n, COL_DIM);
             ncplane_printf_yx(n, r, lx + 2, "(none)");
             ui_reset_color(n);
         } else {
-            for (int m = 0; m < match_count && r < popup_y + h - 1; m++) {
+            for (int m = 0; m < match_count && r < p.y + p.h - 1; m++) {
                 int ri = matches[m];
                 const char *rname = rs->rules[ri].display_name
                     ? rs->rules[ri].display_name
@@ -998,9 +1076,9 @@ static int window_detail_popup(ui_state_machine_t *sm, struct client *c, struct 
 
         ui_set_color(n, COL_DIM);
         if (match_count > 0)
-            ncplane_printf_yx(n, popup_y + h - 1, popup_x + 3, " Enter:Go to rule  Esc:Close ");
+            ncplane_printf_yx(n, p.y + p.h - 1, p.x + 3, " Enter:Go to rule  Esc:Close ");
         else
-            ncplane_printf_yx(n, popup_y + h - 1, popup_x + 3, " Esc:Close ");
+            ncplane_printf_yx(n, p.y + p.h - 1, p.x + 3, " Esc:Close ");
         ui_reset_color(n);
 
         notcurses_render(sm->nc);
@@ -1080,12 +1158,16 @@ static void draw_review_view(ui_state_machine_t *sm, struct ui_state *st, int y,
 
     /* summary line at top */
     int summary_y = y + 1;
-    ui_set_color(n, COL_DIM);
     {
         int active_count = (int)st->rules.count - unused_count;
+        ui_set_color(n, COL_DIM);
         ncplane_printf_yx(n, summary_y, 2,
-            "Total: %zu  Active: %d  Unused: %d  Missing: %d",
-            st->rules.count, active_count, unused_count, missing_count);
+            "Total: %zu  Active: %d  ", st->rules.count, active_count);
+        if (unused_count > 0) ui_set_color(n, COL_WARN);
+        ncplane_printf(n, "Unused: %d  ", unused_count);
+        if (missing_count > 0) ui_set_color(n, COL_ERROR);
+        else ui_set_color(n, COL_DIM);
+        ncplane_printf(n, "Missing: %d", missing_count);
     }
     ui_reset_color(n);
 
@@ -1093,14 +1175,6 @@ static void draw_review_view(ui_state_machine_t *sm, struct ui_state *st, int y,
     int table_y = summary_y + 2;
     int visible = y + h - 1 - table_y; /* rows available for table content */
     if (visible < 1) return;
-
-    /* scroll management: we need to account for section headers as non-selectable lines
-     * but for simplicity, scroll is based on the selected item index */
-    int max_scroll = total > visible ? total - visible : 0;
-    if (st->scroll > max_scroll) st->scroll = max_scroll;
-    if (st->scroll < 0) st->scroll = 0;
-    if (st->selected < st->scroll) st->scroll = st->selected;
-    if (st->selected >= st->scroll + visible) st->scroll = st->selected - visible + 1;
 
     /* column layout */
     int usable = w - 4;
@@ -1123,9 +1197,61 @@ static void draw_review_view(ui_state_machine_t *sm, struct ui_state *st, int y,
     ui_reset_color(n);
 
     /* draw items */
-    for (int vi = 0; vi < visible && (st->scroll + vi) < total; vi++) {
-        int idx = st->scroll + vi;
+    int header_rows = (unused_count > 0 ? 1 : 0) + (missing_count > 0 ? 1 : 0);
+    int display_total = total + header_rows;
+    int max_scroll_d = display_total > visible ? display_total - visible : 0;
+    if (st->scroll > max_scroll_d) st->scroll = max_scroll_d;
+
+    /* map selected item index to display row (accounting for section headers) */
+    int sel_display = st->selected;
+    if (unused_count > 0) sel_display++; /* unused header before item 0 */
+    if (st->selected >= unused_count && missing_count > 0) sel_display++; /* missing header */
+
+    if (sel_display < st->scroll) st->scroll = sel_display;
+    if (sel_display >= st->scroll + visible) st->scroll = sel_display - visible + 1;
+
+    for (int vi = 0; vi < visible; vi++) {
+        int di = st->scroll + vi; /* display index (includes headers) */
         int row = table_y + vi;
+
+        /* determine what this display row shows */
+        int unused_hdr = (unused_count > 0) ? 0 : -1; /* display index of unused header */
+        int missing_hdr = -1;
+        int item_offset = 0; /* running offset to subtract from di to get item index */
+
+        /* unused section header is at display index 0 if unused_count > 0 */
+        if (unused_hdr >= 0 && di == unused_hdr) {
+            ui_set_color(n, COL_WARN);
+            int cx = 2;
+            ncplane_putstr_yx(n, row, cx, "\u2500\u2500 "); cx += 3;
+            char label[64];
+            snprintf(label, sizeof(label), "Unused Rules (%d) ", unused_count);
+            ncplane_putstr_yx(n, row, cx, label); cx += (int)strlen(label);
+            for (; cx < w - 2; cx++)
+                ncplane_putstr_yx(n, row, cx, "\u2500");
+            ui_reset_color(n);
+            continue;
+        }
+        if (unused_count > 0) item_offset = 1;
+
+        /* missing section header position */
+        missing_hdr = unused_count + item_offset;
+        if (missing_count > 0 && di == missing_hdr) {
+            ui_set_color(n, COL_ERROR);
+            int cx = 2;
+            ncplane_putstr_yx(n, row, cx, "\u2500\u2500 "); cx += 3;
+            char label[64];
+            snprintf(label, sizeof(label), "Missing Rules (%d) ", missing_count);
+            ncplane_putstr_yx(n, row, cx, label); cx += (int)strlen(label);
+            for (; cx < w - 2; cx++)
+                ncplane_putstr_yx(n, row, cx, "\u2500");
+            ui_reset_color(n);
+            continue;
+        }
+        if (missing_count > 0 && di > missing_hdr) item_offset++;
+
+        int idx = di - item_offset;
+        if (idx < 0 || idx >= total) continue;
 
         if (idx < unused_count) {
             /* unused rule */
@@ -1180,54 +1306,29 @@ static void draw_review_view(ui_state_machine_t *sm, struct ui_state *st, int y,
     }
 
     /* scrollbar */
-    if (max_scroll > 0) {
-        int bar_h = visible;
-        int thumb = (bar_h * visible) / total;
-        if (thumb < 1) thumb = 1;
-        int thumb_pos = (bar_h * st->scroll) / total;
-        for (int i = 0; i < bar_h; i++) {
-            if (i >= thumb_pos && i < thumb_pos + thumb) {
-                ui_set_color(n, COL_SELECT);
-                ncplane_putstr_yx(n, table_y + i, w - 1, "\u2588");
-            } else {
-                ui_set_color(n, COL_DIM);
-                ncplane_putstr_yx(n, table_y + i, w - 1, "\u2502");
-            }
-            ui_reset_color(n);
-        }
-    }
+    if (max_scroll_d > 0)
+        draw_scrollbar(n, table_y, w - 1, visible, display_total, st->scroll);
 }
 
 /* returns rule index to jump to, -1 if closed, -2 if rule was deleted */
 static int review_unused_popup(ui_state_machine_t *sm, int rule_idx) {
     struct ui_state *st = sm->st;
     struct ncplane *n = sm->std;
-    unsigned scr_h, scr_w;
-    ncplane_dim_yx(n, &scr_h, &scr_w);
 
     if (rule_idx < 0 || rule_idx >= (int)st->rules.count)
         return -1;
 
     struct rule *r = &st->rules.rules[rule_idx];
 
-    int h = 16;
-    int w_popup = 60;
-    if (w_popup > (int)scr_w - 4) w_popup = (int)scr_w - 4;
-    if (h > (int)scr_h - 2) h = (int)scr_h - 2;
-    int popup_y = ((int)scr_h - h) / 2;
-    int popup_x = ((int)scr_w - w_popup) / 2;
-    int content_w = w_popup - 4;
+    struct popup_rect p = popup_center(n, 16, 60, 2, 4);
+    int content_w = p.w - 4;
 
     while (1) {
-        for (int i = 0; i < h; i++)
-            ui_fill_row(n, popup_y + i, popup_x, w_popup, ' ');
-
         const char *display = r->display_name ? r->display_name : r->name;
-        draw_box(n, popup_y, popup_x, h, w_popup,
-                 display ? display : "Unused Rule");
+        popup_draw(n, p, display ? display : "Unused Rule");
 
-        int row = popup_y + 2;
-        int lx = popup_x + 2;
+        int row = p.y + 2;
+        int lx = p.x + 2;
 
         ncplane_on_styles(n, NCSTYLE_BOLD);
         ui_set_color(n, COL_WARN);
@@ -1262,7 +1363,7 @@ static int review_unused_popup(ui_state_machine_t *sm, int rule_idx) {
             ncplane_printf_yx(n, row++, lx + 2, "Float:     %s", r->actions.float_val ? "Yes" : "No");
 
         ui_set_color(n, COL_DIM);
-        ncplane_printf_yx(n, popup_y + h - 1, popup_x + 3,
+        ncplane_printf_yx(n, p.y + p.h - 1, p.x + 3,
                           " Enter:Go to rule  d:Delete  Esc:Close ");
         ui_reset_color(n);
 
@@ -1282,22 +1383,7 @@ static int review_unused_popup(ui_state_machine_t *sm, int rule_idx) {
             char msg[128];
             snprintf(msg, sizeof(msg), "Delete rule '%s'?", rname);
             if (confirm_dialog(sm, "Delete Rule", msg)) {
-                struct rule deleted_copy = rule_copy(r);
-                char desc[128];
-                snprintf(desc, sizeof(desc), "Delete rule %d", rule_idx);
-                history_record(&st->history, rule_idx, &deleted_copy, NULL, desc);
-                rule_free(&deleted_copy);
-
-                rule_free(r);
-                for (int i = rule_idx; i < (int)st->rules.count - 1; i++) {
-                    st->rules.rules[i] = st->rules.rules[i + 1];
-                    if (st->rule_status) st->rule_status[i] = st->rule_status[i + 1];
-                    if (st->rule_modified) st->rule_modified[i] = st->rule_modified[i + 1];
-                    if (st->file_order) st->file_order[i] = st->file_order[i + 1];
-                }
-                st->rules.count--;
-                st->modified = 1;
-                compute_rule_status(st);
+                delete_rule_with_history(st, rule_idx, "Delete");
                 return -2;
             }
             /* confirm_dialog returned false — redraw popup */
@@ -1307,26 +1393,16 @@ static int review_unused_popup(ui_state_machine_t *sm, int rule_idx) {
 
 static int review_missing_popup(ui_state_machine_t *sm, struct missing_rule *mr) {
     struct ncplane *n = sm->std;
-    unsigned scr_h, scr_w;
-    ncplane_dim_yx(n, &scr_h, &scr_w);
 
-    int h = 12;
-    int w_popup = 56;
-    if (w_popup > (int)scr_w - 4) w_popup = (int)scr_w - 4;
-    if (h > (int)scr_h - 2) h = (int)scr_h - 2;
-    int popup_y = ((int)scr_h - h) / 2;
-    int popup_x = ((int)scr_w - w_popup) / 2;
-    int content_w = w_popup - 4;
+    struct popup_rect p = popup_center(n, 12, 56, 2, 4);
+    int content_w = p.w - 4;
 
     while (1) {
-        for (int i = 0; i < h; i++)
-            ui_fill_row(n, popup_y + i, popup_x, w_popup, ' ');
-        draw_box(n, popup_y, popup_x, h, w_popup,
-                 mr->app_name ? mr->app_name : "Missing Rule");
+        popup_draw(n, p, mr->app_name ? mr->app_name : "Missing Rule");
 
-        int row = popup_y + 2;
-        int lx = popup_x + 2;
-        int vx = popup_x + 18;
+        int row = p.y + 2;
+        int lx = p.x + 2;
+        int vx = p.x + 18;
 
         ncplane_on_styles(n, NCSTYLE_BOLD);
         ui_set_color(n, COL_ERROR);
@@ -1364,7 +1440,7 @@ static int review_missing_popup(ui_state_machine_t *sm, struct missing_rule *mr)
         ui_reset_color(n);
 
         ui_set_color(n, COL_DIM);
-        ncplane_printf_yx(n, popup_y + h - 1, popup_x + 3,
+        ncplane_printf_yx(n, p.y + p.h - 1, p.x + 3,
                           " Enter:Create rule  Esc:Close ");
         ui_reset_color(n);
 
@@ -1381,34 +1457,8 @@ static int review_missing_popup(ui_state_machine_t *sm, struct missing_rule *mr)
         if (id == NCKEY_ENTER || id == '\n') {
             struct ui_state *st = sm->st;
 
-            /* grow rules array */
-            struct rule *new_rules = realloc(st->rules.rules,
-                (st->rules.count + 1) * sizeof(struct rule));
-            if (!new_rules) return -1;
-            st->rules.rules = new_rules;
-            int new_idx = (int)st->rules.count;
-            memset(&st->rules.rules[new_idx], 0, sizeof(struct rule));
-            st->rules.count++;
-
-            /* grow parallel arrays */
-            enum rule_status *new_status = realloc(st->rule_status,
-                st->rules.count * sizeof(enum rule_status));
-            if (new_status) {
-                st->rule_status = new_status;
-                st->rule_status[new_idx] = RULE_OK;
-            }
-            int *new_mod = realloc(st->rule_modified,
-                st->rules.count * sizeof(int));
-            if (new_mod) {
-                st->rule_modified = new_mod;
-                st->rule_modified[new_idx] = 0;
-            }
-            int *new_fo = realloc(st->file_order,
-                st->rules.count * sizeof(int));
-            if (new_fo) {
-                st->file_order = new_fo;
-                st->file_order[new_idx] = new_idx;
-            }
+            int new_idx = append_rule(st);
+            if (new_idx < 0) return -1;
 
             /* pre-fill from missing rule data */
             struct rule *r = &st->rules.rules[new_idx];
@@ -1437,35 +1487,27 @@ static int review_missing_popup(ui_state_machine_t *sm, struct missing_rule *mr)
 
 static int confirm_dialog(ui_state_machine_t *sm, const char *title, const char *msg) {
     struct ncplane *n = sm->std;
-    unsigned scr_h, scr_w;
-    ncplane_dim_yx(n, &scr_h, &scr_w);
-    int h = 7, w = 50;
-    int y = ((int)scr_h - h) / 2;
-    int x = ((int)scr_w - w) / 2;
+    struct popup_rect p = popup_center(n, 7, 50, 0, 0);
     int choice = 0; /* 0 = Yes, 1 = No */
 
     while (1) {
         ui_set_color(n, COL_BORDER);
-        for (int i = 0; i < h; i++) {
-            ui_fill_row(n, y + i, x, w, ' ');
-        }
-        draw_box(n, y, x, h, w, title);
-        ui_reset_color(n);
+        popup_draw(n, p, title);
 
-        ncplane_printf_yx(n, y + 2, x + 3, "%.44s", msg);
+        ncplane_printf_yx(n, p.y + 2, p.x + 3, "%.44s", msg);
 
         if (choice == 0) ui_set_color(n, COL_SELECT);
         else ui_set_color(n, COL_DIM);
-        ncplane_printf_yx(n, y + 4, x + 10, " Yes ");
+        ncplane_printf_yx(n, p.y + 4, p.x + 10, " Yes ");
         ui_reset_color(n);
 
         if (choice == 1) ui_set_color(n, COL_SELECT);
         else ui_set_color(n, COL_DIM);
-        ncplane_printf_yx(n, y + 4, x + 20, " No ");
+        ncplane_printf_yx(n, p.y + 4, p.x + 20, " No ");
         ui_reset_color(n);
 
         ui_set_color(n, COL_DIM);
-        ncplane_printf_yx(n, y + 5, x + 3, "y/n  Left/Right  Enter");
+        ncplane_printf_yx(n, p.y + 5, p.x + 3, "y/n  Left/Right  Enter");
         ui_reset_color(n);
 
         notcurses_render(sm->nc);
@@ -1479,9 +1521,9 @@ static int confirm_dialog(ui_state_machine_t *sm, const char *title, const char 
         if (id == 'n' || id == 'N' || id == NCKEY_ESC || id == 'q') return 0;
         if (id == NCKEY_LEFT || id == NCKEY_RIGHT || id == '\t') choice = !choice;
         if (id == NCKEY_ENTER || id == '\n') return choice == 0 ? 1 : 0;
-        if (id == NCKEY_BUTTON1 && ni.y == y + 4) {
-            if (ni.x >= x + 10 && ni.x < x + 16) return 1;
-            if (ni.x >= x + 20 && ni.x < x + 25) return 0;
+        if (id == NCKEY_BUTTON1 && ni.y == p.y + 4) {
+            if (ni.x >= p.x + 10 && ni.x < p.x + 16) return 1;
+            if (ni.x >= p.x + 20 && ni.x < p.x + 25) return 0;
         }
     }
 }
@@ -1586,16 +1628,11 @@ static void get_disabled_path(const char *rules_path, char *out, size_t out_sz) 
 
 static int edit_rule_modal(ui_state_machine_t *sm, struct rule *r, int rule_index, struct history_stack *history) {
     struct ncplane *n = sm->std;
-    unsigned scr_h, scr_w;
-    ncplane_dim_yx(n, &scr_h, &scr_w);
 
     int base_h = 20;
     int extras_h = r->extras_count > 0 ? (int)r->extras_count + 2 : 0;
-    int h = base_h + extras_h;
-    if (h > (int)scr_h - 4) h = (int)scr_h - 4;
-    int w = 60;
-    int y = ((int)scr_h - h) / 2;
-    int x = ((int)scr_w - w) / 2;
+    struct popup_rect p = popup_center(n, base_h + extras_h, 60, 4, 0);
+    int h = p.h, w = p.w, y = p.y, x = p.x;
 
     enum { F_NAME, F_DERIVED, F_CLASS, F_TITLE, F_TAG, F_WORKSPACE, F_FLOAT, F_CENTER, F_SIZE, F_OPACITY, F_COUNT };
     int field = 0;
@@ -1626,11 +1663,7 @@ static int edit_rule_modal(ui_state_machine_t *sm, struct rule *r, int rule_inde
 
     while (1) {
         ui_set_color(n, COL_BORDER);
-        for (int i = 0; i < h; i++) {
-            ui_fill_row(n, y + i, x, w, ' ');
-        }
-        draw_box(n, y, x, h, w, "Edit Rule");
-        ui_reset_color(n);
+        popup_draw(n, p, "Edit Rule");
 
         char derived[64] = "";
         clean_class_name(class_buf, derived, sizeof(derived));
@@ -1798,7 +1831,7 @@ static int edit_rule_modal(ui_state_machine_t *sm, struct rule *r, int rule_inde
 
             char desc[128];
             snprintf(desc, sizeof(desc), "Edit rule %d", rule_index);
-            history_record(history, rule_index, &old_state, r, desc);
+            history_record(history, CHANGE_EDIT, rule_index, &old_state, r, desc);
             rule_free(&old_state);
 
             notcurses_cursor_disable(sm->nc);
@@ -1894,17 +1927,12 @@ static void search_prev(struct search_state *s) {
 
 static int search_modal(ui_state_machine_t *sm, struct search_state *s, struct ruleset *rs) {
     struct ncplane *n = sm->std;
-    unsigned scr_h, scr_w;
-    ncplane_dim_yx(n, &scr_h, &scr_w);
-    int h = 7, w = 60;
-    int y = ((int)scr_h - h) / 2;
-    int x = ((int)scr_w - w) / 2;
+    struct popup_rect p = popup_center(n, 7, 60, 0, 0);
+    int y = p.y, x = p.x;
 
     while (1) {
         ui_set_color(n, COL_BORDER);
-        for (int i = 0; i < h; i++) ui_fill_row(n, y + i, x, w, ' ');
-        draw_box(n, y, x, h, w, "Search Rules");
-        ui_reset_color(n);
+        popup_draw(n, p, "Search Rules");
 
         ncplane_printf_yx(n, y + 2, x + 2, "Query: ");
         ui_set_color(n, COL_SELECT);
@@ -2119,28 +2147,22 @@ static void action_bulk_rename(ui_state_machine_t *sm) {
 
     /* scrollable preview popup */
     int scroll = 0;
-    int h = (int)scr_h - 4;
-    int w_popup = (int)scr_w - 8;
-    if (h < 10) h = 10;
-    if (w_popup < 50) w_popup = 50;
-    if (h > (int)scr_h - 2) h = (int)scr_h - 2;
-    if (w_popup > (int)scr_w - 2) w_popup = (int)scr_w - 2;
-    int popup_y = ((int)scr_h - h) / 2;
-    int popup_x = ((int)scr_w - w_popup) / 2;
-    int content_w = w_popup - 4;
-    int visible = h - 5; /* header + footer rows */
+    int want_h = (int)scr_h - 4;
+    int want_w = (int)scr_w - 8;
+    if (want_h < 10) want_h = 10;
+    if (want_w < 50) want_w = 50;
+    struct popup_rect p = popup_center(n, want_h, want_w, 2, 2);
+    int content_w = p.w - 4;
+    int visible = p.h - 5; /* header + footer rows */
 
     while (1) {
-        for (int i = 0; i < h; i++)
-            ui_fill_row(n, popup_y + i, popup_x, w_popup, ' ');
-
         char title[64];
         snprintf(title, sizeof(title), "Bulk Rename (%d change%s)",
                  would_change, would_change == 1 ? "" : "s");
-        draw_box(n, popup_y, popup_x, h, w_popup, title);
+        popup_draw(n, p, title);
 
-        int lx = popup_x + 2;
-        int row = popup_y + 2;
+        int lx = p.x + 2;
+        int row = p.y + 2;
 
         /* column headers */
         ncplane_on_styles(n, NCSTYLE_BOLD);
@@ -2174,7 +2196,7 @@ static void action_bulk_rename(ui_state_machine_t *sm) {
         /* scroll indicator */
         if (would_change > visible) {
             ui_set_color(n, COL_DIM);
-            ncplane_printf_yx(n, popup_y + h - 2, lx,
+            ncplane_printf_yx(n, p.y + p.h - 2, lx,
                               "(%d-%d of %d)",
                               scroll + 1,
                               scroll + visible < would_change ? scroll + visible : would_change,
@@ -2183,7 +2205,7 @@ static void action_bulk_rename(ui_state_machine_t *sm) {
         }
 
         ui_set_color(n, COL_DIM);
-        ncplane_printf_yx(n, popup_y + h - 1, popup_x + 3,
+        ncplane_printf_yx(n, p.y + p.h - 1, p.x + 3,
                           " Enter:Apply  Esc:Cancel ");
         ui_reset_color(n);
 
@@ -2338,16 +2360,13 @@ static void action_merge_duplicates(ui_state_machine_t *sm) {
 
     /* scrollable preview popup */
     int scroll = 0;
-    int h = (int)scr_h - 4;
-    int w_popup = (int)scr_w - 8;
-    if (h < 10) h = 10;
-    if (w_popup < 50) w_popup = 50;
-    if (h > (int)scr_h - 2) h = (int)scr_h - 2;
-    if (w_popup > (int)scr_w - 2) w_popup = (int)scr_w - 2;
-    int popup_y = ((int)scr_h - h) / 2;
-    int popup_x = ((int)scr_w - w_popup) / 2;
-    int content_w = w_popup - 4;
-    int visible = h - 5;
+    int want_h = (int)scr_h - 4;
+    int want_w = (int)scr_w - 8;
+    if (want_h < 10) want_h = 10;
+    if (want_w < 50) want_w = 50;
+    struct popup_rect p = popup_center(n, want_h, want_w, 2, 2);
+    int content_w = p.w - 4;
+    int visible = p.h - 5;
 
     /* build preview lines */
     /* each group: header + one line per rule showing its unique actions */
@@ -2420,16 +2439,13 @@ static void action_merge_duplicates(ui_state_machine_t *sm) {
     nlines = li;
 
     while (1) {
-        for (int i = 0; i < h; i++)
-            ui_fill_row(n, popup_y + i, popup_x, w_popup, ' ');
-
         char title[64];
         snprintf(title, sizeof(title), "Merge Duplicates (%d group%s, %d removed)",
                  ngroups, ngroups == 1 ? "" : "s", total_removed);
-        draw_box(n, popup_y, popup_x, h, w_popup, title);
+        popup_draw(n, p, title);
 
-        int lx = popup_x + 2;
-        int row = popup_y + 2;
+        int lx = p.x + 2;
+        int row = p.y + 2;
 
         for (int i = 0; i < visible && scroll + i < nlines; i++) {
             const char *line = lines[scroll + i];
@@ -2452,7 +2468,7 @@ static void action_merge_duplicates(ui_state_machine_t *sm) {
 
         if (nlines > visible) {
             ui_set_color(n, COL_DIM);
-            ncplane_printf_yx(n, popup_y + h - 2, lx,
+            ncplane_printf_yx(n, p.y + p.h - 2, lx,
                               "(%d-%d of %d lines)",
                               scroll + 1,
                               scroll + visible < nlines ? scroll + visible : nlines,
@@ -2461,7 +2477,7 @@ static void action_merge_duplicates(ui_state_machine_t *sm) {
         }
 
         ui_set_color(n, COL_DIM);
-        ncplane_printf_yx(n, popup_y + h - 1, popup_x + 3,
+        ncplane_printf_yx(n, p.y + p.h - 1, p.x + 3,
                           " Enter:Merge  Esc:Cancel ");
         ui_reset_color(n);
 
@@ -2504,14 +2520,7 @@ static void action_merge_duplicates(ui_state_machine_t *sm) {
                 /* delete merged-away rules in reverse order */
                 for (int r = groups[g].count - 1; r >= 1; r--) {
                     int ri = groups[g].indices[r];
-                    rule_free(&st->rules.rules[ri]);
-                    for (int k = ri; k < (int)st->rules.count - 1; k++) {
-                        st->rules.rules[k] = st->rules.rules[k + 1];
-                        if (st->rule_status) st->rule_status[k] = st->rule_status[k + 1];
-                        if (st->rule_modified) st->rule_modified[k] = st->rule_modified[k + 1];
-                        if (st->file_order) st->file_order[k] = st->file_order[k + 1];
-                    }
-                    st->rules.count--;
+                    remove_rule_at(st, ri);
                     merged++;
                 }
                 if (st->rule_modified) st->rule_modified[keep] = 1;
@@ -2717,7 +2726,7 @@ static void draw_ui(ui_state_machine_t *sm) {
         break;
     }
 
-    const char *help;
+    const char *help = "F1:Help";
     switch (sm->current_state) {
     case VIEW_RULES:
         help = "Enter:Edit  /:Find  s:Sort  ^S:Save  F1:Help";
@@ -2731,9 +2740,6 @@ static void draw_ui(ui_state_machine_t *sm) {
     case VIEW_ACTIONS:
         help = "Enter:Run action  F1:Help";
         break;
-    default:
-        help = "F1:Help";
-        break;
     }
     draw_statusbar(n, (int)height - 1, width, st->status, help);
 
@@ -2742,8 +2748,6 @@ static void draw_ui(ui_state_machine_t *sm) {
 
 static void help_popup(ui_state_machine_t *sm) {
     struct ncplane *n = sm->std;
-    unsigned scr_h, scr_w;
-    ncplane_dim_yx(n, &scr_h, &scr_w);
 
     static const char *lines[] = {
         "Navigation",
@@ -2783,17 +2787,11 @@ static void help_popup(ui_state_machine_t *sm) {
     };
     int nlines = (int)(sizeof(lines) / sizeof(lines[0]));
 
-    int h = nlines + 4;
-    int w = 42;
-    if (h > (int)scr_h - 2) h = (int)scr_h - 2;
-    if (w > (int)scr_w - 4) w = (int)scr_w - 4;
-    int y = ((int)scr_h - h) / 2;
-    int x = ((int)scr_w - w) / 2;
+    struct popup_rect p = popup_center(n, nlines + 4, 42, 2, 4);
+    int h = p.h, w = p.w, y = p.y, x = p.x;
 
     while (1) {
-        for (int i = 0; i < h; i++)
-            ui_fill_row(n, y + i, x, w, ' ');
-        draw_box(n, y, x, h, w, "Keybindings");
+        popup_draw(n, p, "Keybindings");
 
         int visible = h - 3;
         for (int i = 0; i < visible && i < nlines; i++) {
@@ -2834,27 +2832,20 @@ static void handle_global_keys(ui_state_machine_t *sm, uint32_t id, ncinput *ni)
         if (st->modified) {
             int choice = 0;
             struct ncplane *n = sm->std;
-            unsigned scr_h, scr_w;
-            ncplane_dim_yx(n, &scr_h, &scr_w);
+            struct popup_rect dp = popup_center(n, 9, 50, 0, 0);
 
             while (1) {
-                int dh = 9, dw = 50;
-                int dy = ((int)scr_h - dh) / 2;
-                int dx = ((int)scr_w - dw) / 2;
-
                 ui_set_color(n, COL_BORDER);
-                for (int i = 0; i < dh; i++) ui_fill_row(n, dy + i, dx, dw, ' ');
-                draw_box(n, dy, dx, dh, dw, "Unsaved Changes");
-                ui_reset_color(n);
+                popup_draw(n, dp, "Unsaved Changes");
 
-                ncplane_printf_yx(n, dy + 2, dx + 3, "You have unsaved changes.");
-                ncplane_printf_yx(n, dy + 3, dx + 3, "What would you like to do?");
+                ncplane_printf_yx(n, dp.y + 2, dp.x + 3, "You have unsaved changes.");
+                ncplane_printf_yx(n, dp.y + 3, dp.x + 3, "What would you like to do?");
 
                 const char *opts[] = {"Save and quit", "Quit without saving", "Cancel"};
                 for (int i = 0; i < 3; i++) {
                     if (i == choice) ui_set_color(n, COL_SELECT);
                     else ui_set_color(n, COL_DIM);
-                    ncplane_printf_yx(n, dy + 5 + i, dx + 5, " %s ", opts[i]);
+                    ncplane_printf_yx(n, dp.y + 5 + i, dp.x + 5, " %s ", opts[i]);
                     ui_reset_color(n);
                 }
                 notcurses_render(sm->nc);
@@ -2968,31 +2959,8 @@ static void handle_rules_input(ui_state_machine_t *sm, uint32_t id, ncinput *ni)
     }
     /* new rule */
     else if (id == 'n' || id == 'N') {
-        /* grow the rules array by one */
-        struct rule *new_rules = realloc(st->rules.rules, (st->rules.count + 1) * sizeof(struct rule));
-        if (new_rules) {
-            st->rules.rules = new_rules;
-            memset(&st->rules.rules[st->rules.count], 0, sizeof(struct rule));
-            int new_idx = (int)st->rules.count;
-            st->rules.count++;
-
-            /* also grow rule_status and rule_modified */
-            enum rule_status *new_status = realloc(st->rule_status, st->rules.count * sizeof(enum rule_status));
-            if (new_status) {
-                st->rule_status = new_status;
-                st->rule_status[new_idx] = RULE_OK;
-            }
-            int *new_mod = realloc(st->rule_modified, st->rules.count * sizeof(int));
-            if (new_mod) {
-                st->rule_modified = new_mod;
-                st->rule_modified[new_idx] = 0;
-            }
-            int *new_fo = realloc(st->file_order, st->rules.count * sizeof(int));
-            if (new_fo) {
-                st->file_order = new_fo;
-                st->file_order[new_idx] = new_idx;
-            }
-
+        int new_idx = append_rule(st);
+        if (new_idx >= 0) {
             st->selected = new_idx;
 
             if (edit_rule_modal(sm, &st->rules.rules[new_idx], new_idx, &st->history)) {
@@ -3017,22 +2985,8 @@ static void handle_rules_input(ui_state_machine_t *sm, uint32_t id, ncinput *ni)
         char msg[64];
         snprintf(msg, sizeof(msg), "Delete rule '%s'?", r->name ? r->name : "(unnamed)");
         if (confirm_dialog(sm, "Delete Rule", msg)) {
-            struct rule deleted_copy = rule_copy(r);
-            char desc[128];
-            snprintf(desc, sizeof(desc), "Delete rule %d", st->selected);
-            history_record(&st->history, st->selected, &deleted_copy, NULL, desc);
-            rule_free(&deleted_copy);
-
-            rule_free(r);
-            for (int i = st->selected; i < (int)st->rules.count - 1; i++) {
-                st->rules.rules[i] = st->rules.rules[i + 1];
-                if (st->rule_status) st->rule_status[i] = st->rule_status[i + 1];
-                if (st->rule_modified) st->rule_modified[i] = st->rule_modified[i + 1];
-            }
-            st->rules.count--;
+            delete_rule_with_history(st, st->selected, "Delete");
             if (st->selected >= (int)st->rules.count && st->selected > 0) st->selected--;
-            st->modified = 1;
-            compute_rule_status(st);
             set_status(st, "Rule deleted (not saved to file)");
         }
     }
@@ -3056,22 +3010,8 @@ static void handle_rules_input(ui_state_machine_t *sm, uint32_t id, ncinput *ni)
             }
 
             if (wrote_ok) {
-                struct rule disabled_copy = rule_copy(r);
-                char desc[128];
-                snprintf(desc, sizeof(desc), "Disable rule %d", st->selected);
-                history_record(&st->history, st->selected, &disabled_copy, NULL, desc);
-                rule_free(&disabled_copy);
-
-                rule_free(r);
-                for (int i = st->selected; i < (int)st->rules.count - 1; i++) {
-                    st->rules.rules[i] = st->rules.rules[i + 1];
-                    if (st->rule_status) st->rule_status[i] = st->rule_status[i + 1];
-                    if (st->rule_modified) st->rule_modified[i] = st->rule_modified[i + 1];
-                }
-                st->rules.count--;
+                delete_rule_with_history(st, st->selected, "Disable");
                 if (st->selected >= (int)st->rules.count && st->selected > 0) st->selected--;
-                st->modified = 1;
-                compute_rule_status(st);
                 set_status(st, "Rule disabled -> %s", disabled_path);
             } else {
                 set_status(st, "Failed to write to %s", disabled_path);
@@ -3082,15 +3022,30 @@ static void handle_rules_input(ui_state_machine_t *sm, uint32_t id, ncinput *ni)
     else if (((id == 'z' || id == 'Z') && ncinput_ctrl_p(ni)) || id == 0x1a) {
         if (history_can_undo(&st->history)) {
             int rule_index = -1;
-            struct rule *old_rule = history_undo(&st->history, &rule_index);
-            if (old_rule && rule_index >= 0 && rule_index < (int)st->rules.count) {
-                rule_free(&st->rules.rules[rule_index]);
-                st->rules.rules[rule_index] = *old_rule;
-                st->selected = rule_index;
-                st->modified = 1;
-                if (st->rule_modified) st->rule_modified[rule_index] = 1;
-                compute_rule_status(st);
-                set_status(st, "Undo complete");
+            enum change_type ctype = CHANGE_EDIT;
+            struct rule *old_rule = history_undo(&st->history, &rule_index, &ctype);
+            if (old_rule && rule_index >= 0) {
+                if (ctype == CHANGE_DELETE) {
+                    /* undo delete = re-insert the deleted rule */
+                    int clamp = rule_index > (int)st->rules.count ? (int)st->rules.count : rule_index;
+                    if (insert_rule_at(st, clamp, old_rule) == 0) {
+                        st->selected = clamp;
+                        st->modified = 1;
+                        compute_rule_status(st);
+                        set_status(st, "Undo delete complete");
+                    }
+                } else if (rule_index < (int)st->rules.count) {
+                    /* undo edit = replace with old state */
+                    rule_free(&st->rules.rules[rule_index]);
+                    st->rules.rules[rule_index] = *old_rule;
+                    old_rule = NULL; /* ownership transferred */
+                    st->selected = rule_index;
+                    st->modified = 1;
+                    if (st->rule_modified) st->rule_modified[rule_index] = 1;
+                    compute_rule_status(st);
+                    set_status(st, "Undo complete");
+                }
+                if (old_rule) { rule_free(old_rule); }
                 free(old_rule);
             }
         } else {
@@ -3101,16 +3056,32 @@ static void handle_rules_input(ui_state_machine_t *sm, uint32_t id, ncinput *ni)
     else if (((id == 'y' || id == 'Y') && ncinput_ctrl_p(ni)) || id == 0x19) {
         if (history_can_redo(&st->history)) {
             int rule_index = -1;
-            struct rule *new_rule = history_redo(&st->history, &rule_index);
-            if (new_rule && rule_index >= 0 && rule_index < (int)st->rules.count) {
-                rule_free(&st->rules.rules[rule_index]);
-                st->rules.rules[rule_index] = *new_rule;
-                st->selected = rule_index;
-                st->modified = 1;
-                if (st->rule_modified) st->rule_modified[rule_index] = 1;
-                compute_rule_status(st);
-                set_status(st, "Redo complete");
-                free(new_rule);
+            enum change_type ctype = CHANGE_EDIT;
+            struct rule *redo_rule = history_redo(&st->history, &rule_index, &ctype);
+            if (redo_rule && rule_index >= 0) {
+                if (ctype == CHANGE_DELETE) {
+                    /* redo delete = remove the rule again */
+                    if (rule_index < (int)st->rules.count) {
+                        remove_rule_at(st, rule_index);
+                        if (st->selected >= (int)st->rules.count && st->selected > 0)
+                            st->selected--;
+                        st->modified = 1;
+                        compute_rule_status(st);
+                        set_status(st, "Redo delete complete");
+                    }
+                    rule_free(redo_rule);
+                    free(redo_rule);
+                } else if (rule_index < (int)st->rules.count) {
+                    /* redo edit = replace with new state */
+                    rule_free(&st->rules.rules[rule_index]);
+                    st->rules.rules[rule_index] = *redo_rule;
+                    st->selected = rule_index;
+                    st->modified = 1;
+                    if (st->rule_modified) st->rule_modified[rule_index] = 1;
+                    compute_rule_status(st);
+                    set_status(st, "Redo complete");
+                    free(redo_rule);
+                }
             }
         } else {
             set_status(st, "Nothing to redo");
@@ -3312,13 +3283,13 @@ int run_tui(void) {
                 }
             }
             else if (ni.y == 1 && id == NCKEY_BUTTON1) {
-                if (ni.x >= 2 && ni.x < 14) {
+                if (ni.x >= tab_x_start[0] && ni.x < tab_x_end[0]) {
                     sm.current_state = VIEW_RULES; st.selected = 0; st.scroll = 0;
-                } else if (ni.x >= 15 && ni.x < 29) {
+                } else if (ni.x >= tab_x_start[1] && ni.x < tab_x_end[1]) {
                     sm.current_state = VIEW_WINDOWS; st.scroll = 0; st.clients_loaded = 0;
-                } else if (ni.x >= 30 && ni.x < 43) {
+                } else if (ni.x >= tab_x_start[2] && ni.x < tab_x_end[2]) {
                     sm.current_state = VIEW_REVIEW; st.selected = 0; st.scroll = 0;
-                } else if (ni.x >= 44 && ni.x < 58) {
+                } else if (ni.x >= tab_x_start[3] && ni.x < tab_x_end[3]) {
                     sm.current_state = VIEW_ACTIONS; st.selected = 0; st.scroll = 0;
                 }
             }
