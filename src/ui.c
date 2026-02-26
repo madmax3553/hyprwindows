@@ -1624,6 +1624,372 @@ static void get_disabled_path(const char *rules_path, char *out, size_t out_sz) 
     }
 }
 
+/* --- class alternatives popup --- */
+
+enum match_mode { MATCH_EXACT, MATCH_PREFIX, MATCH_CONTAINS, MATCH_MODE_COUNT };
+static const char *match_mode_labels[] = {"Exact", "Prefix", "Contains"};
+static const char *match_mode_short[]  = {"=", "^", "*"};
+
+/*
+ * parse "^(A|B.*|.*C.*)$" or "(?i)^(A|B.*)$" into alternatives with modes.
+ * returns count; fills alts[] (raw class name), modes[]; sets *case_insensitive.
+ */
+static int parse_class_alternatives(const char *regex, char alts[][128],
+                                    int modes[], int max_alts, int *case_insensitive) {
+    if (!regex || !regex[0]) return 0;
+
+    const char *p = regex;
+    *case_insensitive = 0;
+
+    /* check for (?i) prefix */
+    if (p[0] == '(' && p[1] == '?' && p[2] == 'i' && p[3] == ')') {
+        *case_insensitive = 1;
+        p += 4;
+    }
+
+    /* must start with ^( */
+    if (*p != '^') return 0;
+    p++;
+    if (*p != '(') return 0;
+    p++;
+
+    int count = 0;
+    while (*p && count < max_alts) {
+        char raw[128];
+        int ri = 0;
+        int depth = 0;
+        while (*p && ri < 126) {
+            if (*p == '(') depth++;
+            else if (*p == ')') {
+                if (depth > 0) depth--;
+                else break;
+            }
+            if (*p == '|' && depth == 0) break;
+            raw[ri++] = *p++;
+        }
+        raw[ri] = '\0';
+
+        /* detect match mode from the raw alternative */
+        int mode = MATCH_EXACT;
+        char *r = raw;
+        int rlen = ri;
+
+        int has_leading = (rlen >= 2 && r[0] == '.' && r[1] == '*');
+        int has_trailing = (rlen >= 2 && r[rlen - 1] == '*' && r[rlen - 2] == '.');
+
+        if (has_leading && has_trailing) {
+            mode = MATCH_CONTAINS;
+            r += 2; rlen -= 4;
+            if (rlen < 0) rlen = 0;
+        } else if (has_trailing && !has_leading) {
+            mode = MATCH_PREFIX;
+            rlen -= 2;
+            if (rlen < 0) rlen = 0;
+        }
+
+        if (rlen > 0 && rlen < 128) {
+            memcpy(alts[count], r, rlen);
+            alts[count][rlen] = '\0';
+            modes[count] = mode;
+            count++;
+        }
+
+        if (*p == '|') p++;
+        else break;
+    }
+
+    /* verify ends with )$ */
+    if (*p == ')') {
+        p++;
+        if (*p == '$' && p[1] == '\0')
+            return count;
+    }
+    return 0; /* not a valid compound pattern */
+}
+
+/* rebuild regex from alternatives with modes and case flag */
+static void build_class_from_alts(char *buf, size_t buf_sz, char alts[][128],
+                                  int *checked, int modes[], int count,
+                                  int case_insensitive) {
+    size_t o = 0;
+
+    if (case_insensitive) {
+        if (o + 4 < buf_sz) { buf[o++] = '('; buf[o++] = '?'; buf[o++] = 'i'; buf[o++] = ')'; }
+    }
+    if (o < buf_sz) buf[o++] = '^';
+    if (o < buf_sz) buf[o++] = '(';
+
+    int first = 1;
+    for (int i = 0; i < count; i++) {
+        if (!checked[i]) continue;
+        if (!first && o < buf_sz - 1) buf[o++] = '|';
+        first = 0;
+
+        size_t alen = strlen(alts[i]);
+
+        if (modes[i] == MATCH_CONTAINS && o + 2 < buf_sz) {
+            buf[o++] = '.'; buf[o++] = '*';
+        }
+
+        for (size_t j = 0; j < alen && o < buf_sz - 4; j++)
+            buf[o++] = alts[i][j];
+
+        if ((modes[i] == MATCH_PREFIX || modes[i] == MATCH_CONTAINS) && o + 2 < buf_sz) {
+            buf[o++] = '.'; buf[o++] = '*';
+        }
+    }
+
+    if (first) {
+        buf[0] = '\0';
+        return;
+    }
+    if (o + 2 < buf_sz) { buf[o++] = ')'; buf[o++] = '$'; }
+    buf[o] = '\0';
+}
+
+/* popup for editing class alternatives with checkboxes, match modes, and case toggle */
+static int class_alternatives_popup(ui_state_machine_t *sm, char *class_buf, size_t class_buf_sz) {
+    struct ncplane *n = sm->std;
+
+    char alts[32][128];
+    int checked[32];
+    int modes[32];
+    int case_insensitive = 0;
+    int count = parse_class_alternatives(class_buf, alts, modes, 32, &case_insensitive);
+    if (count == 0) return 0; /* not a compound pattern, caller should use text edit */
+
+    for (int i = 0; i < count; i++) checked[i] = 1;
+
+    int sel = 0; /* selected row: 0..count-1 = alternatives, count = add row */
+    int adding = 0; /* 1 = typing in the add row */
+    char add_buf[128] = "";
+    int add_cursor = 0;
+    int scroll = 0;
+
+    while (1) {
+        int total_rows = count + 1; /* alternatives + add row */
+        /* +7: border*2 + case toggle + header + items + hint*2 */
+        int popup_h = total_rows + 8;
+        if (popup_h > 24) popup_h = 24;
+        int popup_w = 60;
+        struct popup_rect p = popup_center(n, popup_h, popup_w, 2, 4);
+        int content_h = p.h - 8;
+        if (content_h < 1) content_h = 1;
+        int avail_w = p.w - 14; /* space for " [x] [=] text" */
+
+        if (scroll > sel) scroll = sel;
+        if (sel >= scroll + content_h) scroll = sel - content_h + 1;
+        if (scroll < 0) scroll = 0;
+
+        popup_draw(n, p, "Class Patterns");
+
+        /* case toggle */
+        ui_set_color(n, COL_ACCENT);
+        ncplane_printf_yx(n, p.y + 2, p.x + 2,
+            "Case: [%c] insensitive      (i:toggle)",
+            case_insensitive ? 'x' : ' ');
+        ui_reset_color(n);
+
+        /* header */
+        ui_set_color(n, COL_DIM);
+        ncplane_printf_yx(n, p.y + 3, p.x + 2, " Chk Mode  Class name");
+        ncplane_printf_yx(n, p.y + 3, p.x + 2 + avail_w + 10, "m:cycle");
+        ui_reset_color(n);
+
+        int row = p.y + 4;
+        for (int vi = 0; vi < content_h && scroll + vi < total_rows; vi++) {
+            int idx = scroll + vi;
+            if (idx < count) {
+                /* alternative row */
+                if (idx == sel) ui_set_color(n, COL_SELECT);
+                else ui_set_color(n, COL_NORMAL);
+
+                ncplane_printf_yx(n, row, p.x + 2, " [%c] [%s] %-*.*s",
+                    checked[idx] ? 'x' : ' ',
+                    match_mode_short[modes[idx]],
+                    avail_w, avail_w, alts[idx]);
+
+                /* show match mode label dimmed at right edge */
+                if (idx == sel) {
+                    int label_len = (int)strlen(match_mode_labels[modes[idx]]);
+                    int label_x = p.x + p.w - label_len - 3;
+                    ui_set_color(n, COL_DIM);
+                    ncplane_printf_yx(n, row, label_x, "%s", match_mode_labels[modes[idx]]);
+                }
+                ui_reset_color(n);
+            } else {
+                /* add row */
+                if (idx == sel) ui_set_color(n, COL_ACCENT);
+                else ui_set_color(n, COL_DIM);
+
+                if (adding) {
+                    int text_avail = avail_w;
+                    if (text_avail < 4) text_avail = 4;
+                    int text_scroll = 0;
+                    if (add_cursor > text_avail - 1)
+                        text_scroll = add_cursor - (text_avail - 1);
+                    int vis_len = (int)strlen(add_buf) - text_scroll;
+                    if (vis_len > text_avail) vis_len = text_avail;
+                    if (vis_len < 0) vis_len = 0;
+                    ncplane_printf_yx(n, row, p.x + 2, "  +        %-*.*s", text_avail, text_avail, "");
+                    ncplane_printf_yx(n, row, p.x + 13, "%.*s", vis_len, add_buf + text_scroll);
+                } else {
+                    ncplane_printf_yx(n, row, p.x + 2, "  +        %-*.*s", avail_w, avail_w, "Add class...");
+                }
+                ui_reset_color(n);
+            }
+            row++;
+        }
+
+        if (total_rows > content_h) {
+            draw_scrollbar(n, p.y + 4, p.x + p.w - 2, content_h, total_rows, scroll);
+        }
+
+        /* hints */
+        ui_set_color(n, COL_DIM);
+        if (adding) {
+            ncplane_printf_yx(n, p.y + p.h - 3, p.x + 2,
+                "Type class name");
+            ncplane_printf_yx(n, p.y + p.h - 2, p.x + 2,
+                "Enter:Confirm  Esc:Cancel");
+        } else {
+            ncplane_printf_yx(n, p.y + p.h - 3, p.x + 2,
+                "Space:Toggle  m:Match mode  i:Case  d:Delete");
+            ncplane_printf_yx(n, p.y + p.h - 2, p.x + 2,
+                "Enter:Add  s:Save  q:Cancel");
+        }
+        ui_reset_color(n);
+
+        if (adding) {
+            int text_avail = avail_w;
+            if (text_avail < 4) text_avail = 4;
+            int text_scroll = 0;
+            if (add_cursor > text_avail - 1)
+                text_scroll = add_cursor - (text_avail - 1);
+            int add_vis_row = p.y + 4 + (count - scroll);
+            if (add_vis_row >= p.y + 4 && add_vis_row < p.y + 4 + content_h)
+                notcurses_cursor_enable(sm->nc, add_vis_row, p.x + 13 + (add_cursor - text_scroll));
+        } else {
+            notcurses_cursor_disable(sm->nc);
+        }
+
+        notcurses_render(sm->nc);
+
+        ncinput ni;
+        uint32_t id = notcurses_get(sm->nc, NULL, &ni);
+        if (id == (uint32_t)-1) continue;
+        if (ni.evtype == NCTYPE_RELEASE) continue;
+
+        if (adding) {
+            int len = (int)strlen(add_buf);
+            if (id == NCKEY_ENTER || id == '\n') {
+                if (add_buf[0] && count < 32) {
+                    snprintf(alts[count], 128, "%s", add_buf);
+                    checked[count] = 1;
+                    modes[count] = MATCH_EXACT;
+                    count++;
+                    add_buf[0] = '\0';
+                    add_cursor = 0;
+                    sel = count; /* select the add row again */
+                }
+                adding = 0;
+                notcurses_cursor_disable(sm->nc);
+            } else if (id == NCKEY_ESC) {
+                add_buf[0] = '\0';
+                add_cursor = 0;
+                adding = 0;
+                notcurses_cursor_disable(sm->nc);
+            } else if (id == NCKEY_LEFT) {
+                if (add_cursor > 0) add_cursor--;
+            } else if (id == NCKEY_RIGHT) {
+                if (add_cursor < len) add_cursor++;
+            } else if (id == NCKEY_HOME) {
+                add_cursor = 0;
+            } else if (id == NCKEY_END) {
+                add_cursor = len;
+            } else if (id == NCKEY_BACKSPACE || id == 127 || id == 8) {
+                if (add_cursor > 0) {
+                    memmove(add_buf + add_cursor - 1, add_buf + add_cursor, len - add_cursor + 1);
+                    add_cursor--;
+                }
+            } else if (id == NCKEY_DEL) {
+                if (add_cursor < len) {
+                    memmove(add_buf + add_cursor, add_buf + add_cursor + 1, len - add_cursor);
+                }
+            } else if (id >= 32 && id < 127 && len < 126) {
+                memmove(add_buf + add_cursor + 1, add_buf + add_cursor, len - add_cursor + 1);
+                add_buf[add_cursor] = (char)id;
+                add_cursor++;
+            }
+            continue;
+        }
+
+        /* navigation mode */
+        if (id == NCKEY_UP || id == NCKEY_SCROLL_UP) {
+            if (sel > 0) sel--;
+        } else if (id == NCKEY_DOWN || id == NCKEY_SCROLL_DOWN) {
+            if (sel < total_rows - 1) sel++;
+        } else if (id == ' ') {
+            if (sel < count) checked[sel] = !checked[sel];
+        } else if (id == 'm' || id == 'M') {
+            /* cycle match mode for selected alternative */
+            if (sel < count) {
+                modes[sel] = (modes[sel] + 1) % MATCH_MODE_COUNT;
+            }
+        } else if (id == 'i' || id == 'I') {
+            /* toggle case sensitivity */
+            case_insensitive = !case_insensitive;
+        } else if (id == NCKEY_ENTER || id == '\n') {
+            if (sel == count) {
+                /* add row */
+                adding = 1;
+                add_buf[0] = '\0';
+                add_cursor = 0;
+            } else if (sel < count) {
+                checked[sel] = !checked[sel];
+            }
+        } else if (id == NCKEY_DEL || id == 'd' || id == 'D') {
+            if (sel < count && count > 1) {
+                /* remove this alternative */
+                for (int i = sel; i < count - 1; i++) {
+                    memcpy(alts[i], alts[i + 1], 128);
+                    checked[i] = checked[i + 1];
+                    modes[i] = modes[i + 1];
+                }
+                count--;
+                if (sel >= count) sel = count - 1;
+            }
+        } else if (id == 's' || id == 'S') {
+            /* save - rebuild regex */
+            build_class_from_alts(class_buf, class_buf_sz, alts, checked, modes,
+                                  count, case_insensitive);
+            notcurses_cursor_disable(sm->nc);
+            return 1;
+        } else if (id == 'q' || id == 'Q' || id == NCKEY_ESC) {
+            notcurses_cursor_disable(sm->nc);
+            return -1; /* cancelled */
+        } else if (id == NCKEY_BUTTON1) {
+            int clicked_vi = ni.y - (p.y + 4);
+            if (clicked_vi >= 0 && clicked_vi < content_h) {
+                int clicked_idx = scroll + clicked_vi;
+                if (clicked_idx < total_rows) {
+                    sel = clicked_idx;
+                    if (sel < count) checked[sel] = !checked[sel];
+                    else if (sel == count) {
+                        adding = 1;
+                        add_buf[0] = '\0';
+                        add_cursor = 0;
+                    }
+                }
+            }
+            /* check if clicked case toggle row */
+            if (ni.y == p.y + 2 && ni.x >= p.x + 2 && ni.x < p.x + 40) {
+                case_insensitive = !case_insensitive;
+            }
+        }
+    }
+}
+
 /* --- rule edit modal --- */
 
 static int edit_rule_modal(ui_state_machine_t *sm, struct rule *r, int rule_index, struct history_stack *history) {
@@ -1660,6 +2026,7 @@ static int edit_rule_modal(ui_state_machine_t *sm, struct rule *r, int rule_inde
     snprintf(orig_opacity, sizeof(orig_opacity), "%s", opacity_buf);
 
     int editing = 0;
+    int cursor_pos = 0;
 
     while (1) {
         ui_set_color(n, COL_BORDER);
@@ -1712,10 +2079,27 @@ static int edit_rule_modal(ui_state_machine_t *sm, struct rule *r, int rule_inde
             } else if (i == F_CENTER) {
                 ncplane_printf_yx(n, row, x + 14, "[%c] %s", center_val ? 'x' : ' ', center_val ? "Yes" : "No");
             } else {
+                int avail = w - 14 - 2; /* usable text width inside popup */
+                if (avail < 4) avail = 4;
                 if (editing && i == field) {
-                    ncplane_printf_yx(n, row, x + 14, "%s_", bufs[i]);
+                    int len = (int)strlen(bufs[i]);
+                    /* compute scroll offset so cursor is always visible */
+                    int scroll = 0;
+                    if (cursor_pos > avail - 1)
+                        scroll = cursor_pos - (avail - 1);
+                    /* print visible portion */
+                    int vis_len = len - scroll;
+                    if (vis_len > avail) vis_len = avail;
+                    if (vis_len < 0) vis_len = 0;
+                    /* blank the field area first */
+                    ncplane_printf_yx(n, row, x + 14, "%-*.*s", avail, avail, "");
+                    ncplane_printf_yx(n, row, x + 14, "%.*s", vis_len, bufs[i] + scroll);
+                    /* draw cursor character */
+                    int cursor_x = x + 14 + (cursor_pos - scroll);
+                    if (cursor_pos < len)
+                        ncplane_putchar_yx(n, row, cursor_x, bufs[i][cursor_pos]);
                 } else {
-                    ncplane_printf_yx(n, row, x + 14, "%-40.40s", bufs[i]);
+                    ncplane_printf_yx(n, row, x + 14, "%-*.*s", avail, avail, bufs[i]);
                 }
             }
 
@@ -1738,8 +2122,8 @@ static int edit_rule_modal(ui_state_machine_t *sm, struct rule *r, int rule_inde
 
         ui_set_color(n, COL_DIM);
         if (editing) {
-            ncplane_printf_yx(n, y + h - 3, x + 2, "Type to edit, Backspace to delete");
-            ncplane_printf_yx(n, y + h - 2, x + 2, "Enter:Done  Esc:Cancel edit");
+            ncplane_printf_yx(n, y + h - 3, x + 2, "Type to edit, Backspace/Del to delete");
+            ncplane_printf_yx(n, y + h - 2, x + 2, "Left/Right:Move  Enter:Done  Esc:Cancel");
         } else {
             ncplane_printf_yx(n, y + h - 3, x + 2, "Up/Down:Select  Enter:Edit  Space:Toggle");
             ncplane_printf_yx(n, y + h - 2, x + 2, "s:Save     q:Cancel");
@@ -1747,7 +2131,11 @@ static int edit_rule_modal(ui_state_machine_t *sm, struct rule *r, int rule_inde
         ui_reset_color(n);
 
         if (editing) {
-            notcurses_cursor_enable(sm->nc, y + 2 + field, x + 14 + (int)strlen(bufs[field]));
+            int avail = w - 14 - 2;
+            if (avail < 4) avail = 4;
+            int scroll = 0;
+            if (cursor_pos > avail - 1) scroll = cursor_pos - (avail - 1);
+            notcurses_cursor_enable(sm->nc, y + 2 + field, x + 14 + (cursor_pos - scroll));
         } else {
             notcurses_cursor_disable(sm->nc);
         }
@@ -1761,18 +2149,34 @@ static int edit_rule_modal(ui_state_machine_t *sm, struct rule *r, int rule_inde
 
         if (editing && bufs[field]) {
             char *buf = bufs[field];
-            size_t len = strlen(buf);
+            int len = (int)strlen(buf);
             if (id == NCKEY_ENTER || id == '\n') {
                 editing = 0;
                 notcurses_cursor_disable(sm->nc);
             } else if (id == NCKEY_ESC) {
                 editing = 0;
                 notcurses_cursor_disable(sm->nc);
+            } else if (id == NCKEY_LEFT) {
+                if (cursor_pos > 0) cursor_pos--;
+            } else if (id == NCKEY_RIGHT) {
+                if (cursor_pos < len) cursor_pos++;
+            } else if (id == NCKEY_HOME) {
+                cursor_pos = 0;
+            } else if (id == NCKEY_END) {
+                cursor_pos = len;
             } else if (id == NCKEY_BACKSPACE || id == 127 || id == 8) {
-                if (len > 0) buf[len - 1] = '\0';
+                if (cursor_pos > 0) {
+                    memmove(buf + cursor_pos - 1, buf + cursor_pos, len - cursor_pos + 1);
+                    cursor_pos--;
+                }
+            } else if (id == NCKEY_DEL) {
+                if (cursor_pos < len) {
+                    memmove(buf + cursor_pos, buf + cursor_pos + 1, len - cursor_pos);
+                }
             } else if (id >= 32 && id < 127 && len < 126) {
-                buf[len] = (char)id;
-                buf[len + 1] = '\0';
+                memmove(buf + cursor_pos + 1, buf + cursor_pos, len - cursor_pos + 1);
+                buf[cursor_pos] = (char)id;
+                cursor_pos++;
             }
             continue;
         }
@@ -1789,7 +2193,13 @@ static int edit_rule_modal(ui_state_machine_t *sm, struct rule *r, int rule_inde
                     else if (field == F_FLOAT) float_val = !float_val;
                     else if (field == F_CENTER) center_val = !center_val;
                     else if (bufs[field]) {
-                        editing = 1;
+                        if (field == F_CLASS) {
+                            int ret = class_alternatives_popup(sm, class_buf, sizeof(class_buf));
+                            if (ret == 0) { editing = 1; cursor_pos = (int)strlen(bufs[field]); }
+                        } else {
+                            editing = 1;
+                            cursor_pos = (int)strlen(bufs[field]);
+                        }
                     }
                 }
             }
@@ -1807,7 +2217,15 @@ static int edit_rule_modal(ui_state_machine_t *sm, struct rule *r, int rule_inde
             }
             else if (field == F_FLOAT) { float_val = !float_val; }
             else if (field == F_CENTER) { center_val = !center_val; }
-            else if (bufs[field]) { editing = 1; }
+            else if (bufs[field]) {
+                if (field == F_CLASS) {
+                    int ret = class_alternatives_popup(sm, class_buf, sizeof(class_buf));
+                    if (ret == 0) { editing = 1; cursor_pos = (int)strlen(bufs[field]); }
+                    /* ret == 1 (saved) or -1 (cancelled): stay in edit_rule_modal */
+                } else {
+                    editing = 1; cursor_pos = (int)strlen(bufs[field]);
+                }
+            }
         }
         else if (id == ' ') {
             if (field == F_FLOAT) { float_val = !float_val; }
