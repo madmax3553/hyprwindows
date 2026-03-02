@@ -22,6 +22,8 @@ struct rule_actions {
     int float_val;
     int center_set;
     int center_val;
+    int fullscreen_set;
+    int fullscreen_val;
 };
 
 /* key-value pair for unknown/extra fields */

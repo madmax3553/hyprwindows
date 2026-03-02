@@ -124,6 +124,15 @@ static int parse_bool_str(const char *s, int *out_set, int *out_val) {
     return -1;
 }
 
+static int parse_int_str(const char *s, int *out) {
+    if (!s || !out) return -1;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0') return -1;
+    *out = (int)v;
+    return 0;
+}
+
 static void parse_rule_kv(struct rule *r, const char *key, char *val) {
     if (str_eq(key, "name")) {
         assign_str(&r->name, val);
@@ -183,6 +192,20 @@ static void parse_rule_kv(struct rule *r, const char *key, char *val) {
         parse_bool_str(val, &r->actions.center_set, &r->actions.center_val);
         free(val);
         return;
+    }
+    if (str_eq(key, "fullscreen")) {
+        int num = 0;
+        if (parse_bool_str(val, &r->actions.fullscreen_set, &r->actions.fullscreen_val) == 0) {
+            free(val);
+            return;
+        }
+        if (parse_int_str(val, &num) == 0) {
+            r->actions.fullscreen_set = 1;
+            r->actions.fullscreen_val = num;
+            free(val);
+            return;
+        }
+        /* unknown fullscreen value: keep it as extra below */
     }
     /* unknown key - store in extras (grow with doubling) */
     size_t n = r->extras_count;

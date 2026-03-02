@@ -54,6 +54,8 @@ struct rule rule_copy(const struct rule *src) {
     dst.actions.float_val = src->actions.float_val;
     dst.actions.center_set = src->actions.center_set;
     dst.actions.center_val = src->actions.center_val;
+    dst.actions.fullscreen_set = src->actions.fullscreen_set;
+    dst.actions.fullscreen_val = src->actions.fullscreen_val;
     dst.actions.size = src->actions.size ? strdup(src->actions.size) : NULL;
     dst.actions.move = src->actions.move ? strdup(src->actions.move) : NULL;
     dst.actions.opacity = src->actions.opacity ? strdup(src->actions.opacity) : NULL;
@@ -86,6 +88,11 @@ void rule_write(FILE *f, const struct rule *r) {
     if (r->actions.workspace) fprintf(f, "    workspace = %s\n", r->actions.workspace);
     if (r->actions.float_set) fprintf(f, "    float = %s\n", r->actions.float_val ? "true" : "false");
     if (r->actions.center_set) fprintf(f, "    center = %s\n", r->actions.center_val ? "true" : "false");
+    if (r->actions.fullscreen_set) {
+        if (r->actions.fullscreen_val == 0) fprintf(f, "    fullscreen = false\n");
+        else if (r->actions.fullscreen_val == 1) fprintf(f, "    fullscreen = true\n");
+        else fprintf(f, "    fullscreen = %d\n", r->actions.fullscreen_val);
+    }
     if (r->actions.size) fprintf(f, "    size = %s\n", r->actions.size);
     if (r->actions.move) fprintf(f, "    move = %s\n", r->actions.move);
     if (r->actions.opacity) fprintf(f, "    opacity = %s\n", r->actions.opacity);
