@@ -1415,9 +1415,9 @@ static int window_detail_popup(ui_state_machine_t *sm, struct client *c, struct 
 
         ui_set_color(n, COL_DIM);
         if (match_count > 0)
-            ncplane_printf_yx(n, p.y + p.h - 1, p.x + 3, " Enter:Go to rule  Esc:Close ");
+            ncplane_printf_yx(n, p.y + p.h - 1, p.x + 3, " Enter:Go to rule  n:New rule  Esc:Close ");
         else
-            ncplane_printf_yx(n, p.y + p.h - 1, p.x + 3, " Esc:Close ");
+            ncplane_printf_yx(n, p.y + p.h - 1, p.x + 3, " n:New rule  Esc:Close ");
         ui_reset_color(n);
 
         notcurses_render(sm->nc);
@@ -1430,6 +1430,33 @@ static int window_detail_popup(ui_state_machine_t *sm, struct client *c, struct 
         if (id == 27 || id == 'q') /* Esc or q to close */
             return -1;
 
+        if (id == 'n' || id == 'N') {
+            /* create a new rule pre-filled from this window */
+            struct ui_state *st = sm->st;
+            int new_idx = append_rule(st);
+            if (new_idx < 0) return -1;
+
+            struct rule *r = &st->rules.rules[new_idx];
+            if (c->class_name) {
+                char buf[512];
+                snprintf(buf, sizeof(buf), "^(%s)$", c->class_name);
+                r->match.class_re = strdup(buf);
+            }
+            if (c->class_name)
+                r->name = strdup(c->class_name);
+
+            if (edit_rule_modal(sm, r, new_idx, &st->history)) {
+                update_display_name(r);
+                st->modified = 1;
+                if (st->rule_modified) st->rule_modified[new_idx] = 1;
+                return new_idx;
+            } else {
+                rule_free(r);
+                st->rules.count--;
+                return -1;
+            }
+        }
+
         if (match_count > 0) {
             if (id == NCKEY_UP && sel > 0) sel--;
             else if (id == NCKEY_DOWN && sel < match_count - 1) sel++;
@@ -1437,9 +1464,6 @@ static int window_detail_popup(ui_state_machine_t *sm, struct client *c, struct 
             else if (id == NCKEY_END) sel = match_count - 1;
             else if (id == NCKEY_ENTER || id == '\n')
                 return matches[sel];
-        } else {
-            /* no matches: any key closes */
-            return -1;
         }
     }
 }
@@ -4142,7 +4166,7 @@ static void draw_ui(ui_state_machine_t *sm) {
         help = "Enter:Edit  o:Overlaps  /:Find  s:Sort  ^S:Save  F1:Help";
         break;
     case VIEW_WINDOWS:
-        help = "Enter:Details  r:Reload  F1:Help";
+        help = "Enter:Details  n:New rule  r:Reload  F1:Help";
         break;
     case VIEW_REVIEW:
         help = "Enter:Details/Create  r:Reload  F1:Help";
@@ -4180,6 +4204,7 @@ static void help_popup(ui_state_machine_t *sm) {
         "",
         "Windows View",
         "  Enter          Show window details",
+        "  n              New rule from window",
         "",
         "Review View",
         "  Enter          Details / create rule",
