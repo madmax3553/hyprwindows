@@ -56,6 +56,9 @@ struct rule rule_copy(const struct rule *src);
 /* write a rule block to an open FILE stream */
 void rule_write(FILE *f, const struct rule *r);
 
+/* 1 if both rules have the same match fields (NULL and "" compare equal) */
+int rule_match_equal(const struct rule *a, const struct rule *b);
+
 char *hypr_find_rules_config(void);
 
 #endif

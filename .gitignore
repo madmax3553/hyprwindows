@@ -23,4 +23,6 @@ TestResults.xml
 
 # Build outputs
 /hyprwindows
+/tests/roundtrip
 *.o
+src/window.moc

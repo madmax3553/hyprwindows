@@ -21,7 +21,11 @@ struct missing_rules {
 
 int rule_matches_client(const struct rule *r, const struct client *c);
 
-int find_missing_rules(const char *rules_path, const char *appmap_path,
+/* pacman -Qi, cached for the session. Not a shell command. */
+int package_installed(const char *pkg);
+void package_cache_clear(void);
+
+int find_missing_rules(const struct ruleset *rules, const char *appmap_path,
                        const char *dotfiles_path, struct missing_rules *out);
 void missing_rules_free(struct missing_rules *mr);
 

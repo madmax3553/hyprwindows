@@ -11,6 +11,7 @@ void history_init(struct history_stack *h) {
 }
 
 void history_record(struct history_stack *h, enum change_type type, int rule_index,
+                    int file_order,
                     const struct rule *old_state, const struct rule *new_state,
                     const char *description) {
     if (!h || !h->records) return;
@@ -33,18 +34,21 @@ void history_record(struct history_stack *h, enum change_type type, int rule_ind
     }
 
     struct change_record *rec = &h->records[h->count];
+    memset(rec, 0, sizeof(*rec));
     rec->type = type;
     rec->rule_index = rule_index;
+    rec->file_order = file_order;
     rec->old_state = rule_copy(old_state);
     rec->new_state = rule_copy(new_state);
     rec->timestamp = time(NULL);
-    snprintf(rec->description, sizeof(rec->description), "%s", description);
+    snprintf(rec->description, sizeof(rec->description), "%s", description ? description : "");
 
     h->count++;
     h->current = h->count;
 }
 
-struct rule *history_undo(struct history_stack *h, int *out_index, enum change_type *out_type) {
+struct rule *history_undo(struct history_stack *h, int *out_index, enum change_type *out_type,
+                          int *out_file_order) {
     if (!h || h->current == 0) return NULL;
 
     h->current--;
@@ -52,6 +56,7 @@ struct rule *history_undo(struct history_stack *h, int *out_index, enum change_t
 
     if (out_index) *out_index = rec->rule_index;
     if (out_type) *out_type = rec->type;
+    if (out_file_order) *out_file_order = rec->file_order;
 
     struct rule *restored = malloc(sizeof(struct rule));
     if (restored) {
@@ -60,7 +65,8 @@ struct rule *history_undo(struct history_stack *h, int *out_index, enum change_t
     return restored;
 }
 
-struct rule *history_redo(struct history_stack *h, int *out_index, enum change_type *out_type) {
+struct rule *history_redo(struct history_stack *h, int *out_index, enum change_type *out_type,
+                          int *out_file_order) {
     if (!h || h->current >= h->count) return NULL;
 
     struct change_record *rec = &h->records[h->current];
@@ -68,6 +74,7 @@ struct rule *history_redo(struct history_stack *h, int *out_index, enum change_t
 
     if (out_index) *out_index = rec->rule_index;
     if (out_type) *out_type = rec->type;
+    if (out_file_order) *out_file_order = rec->file_order;
 
     /* for delete records, return old_state (the deleted rule) so caller knows what was deleted;
        for edit records, return new_state as before */

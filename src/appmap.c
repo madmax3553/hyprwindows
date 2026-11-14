@@ -29,10 +29,12 @@ static char *extract_string(const char *p, const char *end, const char **out_pos
     if (p >= end) return NULL;
 
     size_t len = (size_t)(p - start);
-    char *s = malloc(len + 1);
-    if (!s) return NULL;
-    memcpy(s, start, len);
-    s[len] = '\0';
+    char *raw = malloc(len + 1);
+    if (!raw) return NULL;
+    memcpy(raw, start, len);
+    raw[len] = '\0';
+    char *s = json_unescape(raw);
+    free(raw);
 
     if (out_pos) *out_pos = p + 1; /* past closing quote */
     return s;

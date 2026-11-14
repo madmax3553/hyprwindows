@@ -41,7 +41,8 @@ static regex_t *cache_put(const char *pattern) {
         e->valid = 0;
     }
 
-    int rc = regcomp(&e->compiled, pattern, REG_EXTENDED | REG_NOSUB | REG_ICASE);
+    /* Hyprland match regexes are case-sensitive. Do not add REG_ICASE. */
+    int rc = regcomp(&e->compiled, pattern, REG_EXTENDED | REG_NOSUB);
     if (rc != 0) {
         return NULL;
     }
@@ -115,22 +116,56 @@ char *read_file(const char *path, size_t *out_len) {
 
 char *expand_home(const char *path) {
     if (!path) return NULL;
-    if (path[0] != '~') {
+
+    const char *rest = NULL;
+    if (path[0] == '~') {
+        rest = path + 1;
+    } else if (strncmp(path, "$HOME", 5) == 0) {
+        rest = path + 5;
+    }
+    if (!rest) {
         return strdup(path);
     }
+
     const char *home = getenv("HOME");
     if (!home) {
         home = ".";
     }
     size_t hlen = strlen(home);
-    size_t plen = strlen(path);
-    /* allocate: hlen + (plen - 1 for skipped '~') + 1 for NUL */
-    char *out = (char *)malloc(hlen + plen);
+    size_t rlen = strlen(rest);
+    char *out = (char *)malloc(hlen + rlen + 1);
     if (!out) {
         return NULL;
     }
     memcpy(out, home, hlen);
-    memcpy(out + hlen, path + 1, plen - 1);
-    out[hlen + plen - 1] = '\0';
+    memcpy(out + hlen, rest, rlen);
+    out[hlen + rlen] = '\0';
+    return out;
+}
+
+char *json_unescape(const char *src) {
+    if (!src) return NULL;
+    size_t n = strlen(src);
+    char *out = (char *)malloc(n + 1);
+    if (!out) return NULL;
+
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (src[i] == '\\' && i + 1 < n) {
+            char e = src[++i];
+            switch (e) {
+            case 'n': out[o++] = '\n'; break;
+            case 't': out[o++] = '\t'; break;
+            case 'r': out[o++] = '\r'; break;
+            case '"':
+            case '\\':
+            case '/': out[o++] = e; break;
+            default: out[o++] = e; break;
+            }
+            continue;
+        }
+        out[o++] = src[i];
+    }
+    out[o] = '\0';
     return out;
 }

@@ -1,9 +1,12 @@
 #include "actions.h"
 
+#include <ctype.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "appmap.h"
@@ -11,30 +14,45 @@
 #include "rules.h"
 #include "util.h"
 
+static int match_field_set(const char *re) {
+    return re && re[0];
+}
+
 int rule_matches_client(const struct rule *r, const struct client *c) {
-    if (r->match.class_re) {
+    if (!r || !c) return 0;
+
+    int verifiable = 0;
+
+    if (match_field_set(r->match.class_re)) {
+        verifiable = 1;
         if (!c->class_name || !regex_match(r->match.class_re, c->class_name)) {
             return 0;
         }
     }
-    if (r->match.title_re) {
+    if (match_field_set(r->match.title_re)) {
+        verifiable = 1;
         if (!c->title || !regex_match(r->match.title_re, c->title)) {
             return 0;
         }
     }
-    if (r->match.initial_class_re) {
+    if (match_field_set(r->match.initial_class_re)) {
+        verifiable = 1;
         if (!c->initial_class || !regex_match(r->match.initial_class_re, c->initial_class)) {
             return 0;
         }
     }
-    if (r->match.initial_title_re) {
+    if (match_field_set(r->match.initial_title_re)) {
+        verifiable = 1;
         if (!c->initial_title || !regex_match(r->match.initial_title_re, c->initial_title)) {
             return 0;
         }
     }
-    /* tag matching skipped — hyprctl doesn't expose window tags,
-       so we can't check match:tag; treat it as always matching
-       to avoid falsely marking rules as unused */
+
+    /* hyprctl clients do not expose tags. A tag-only rule must not match
+       every window — that made pipeline tag rules look like overlaps. */
+    if (!verifiable && match_field_set(r->match.tag_re)) {
+        return 0;
+    }
     return 1;
 }
 
@@ -48,11 +66,68 @@ static int rules_cover_class(const struct ruleset *rules, const char *class_name
     return 0;
 }
 
-/* check if package is installed via pacman */
-static int package_installed(const char *pkg) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "pacman -Qi %s >/dev/null 2>&1", pkg);
-    return system(cmd) == 0;
+/* check if package is installed via pacman, without a shell */
+#define PKG_CACHE_MAX 256
+
+static struct {
+    char *name;
+    int installed;
+} pkg_cache[PKG_CACHE_MAX];
+static size_t pkg_cache_len;
+
+static int pkg_name_ok(const char *pkg) {
+    if (!pkg || !pkg[0] || strlen(pkg) > 128) return 0;
+    for (const char *p = pkg; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isalnum(c) || c == '-' || c == '_' || c == '+' || c == '.' || c == '@') {
+            continue;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static int package_installed_uncached(const char *pkg) {
+    pid_t pid = fork();
+    if (pid < 0) return 0;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2) close(devnull);
+        }
+        execlp("pacman", "pacman", "-Qi", pkg, (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return 0;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+int package_installed(const char *pkg) {
+    if (!pkg_name_ok(pkg)) return 0;
+    for (size_t i = 0; i < pkg_cache_len; i++) {
+        if (strcmp(pkg_cache[i].name, pkg) == 0) return pkg_cache[i].installed;
+    }
+    int installed = package_installed_uncached(pkg);
+    if (pkg_cache_len < PKG_CACHE_MAX) {
+        char *name = strdup(pkg);
+        if (name) {
+            pkg_cache[pkg_cache_len].name = name;
+            pkg_cache[pkg_cache_len].installed = installed;
+            pkg_cache_len++;
+        }
+    }
+    return installed;
+}
+
+void package_cache_clear(void) {
+    for (size_t i = 0; i < pkg_cache_len; i++) {
+        free(pkg_cache[i].name);
+        pkg_cache[i].name = NULL;
+    }
+    pkg_cache_len = 0;
 }
 
 /* check if dotfile config exists */
@@ -96,18 +171,14 @@ void missing_rules_free(struct missing_rules *mr) {
     mr->count = 0;
 }
 
-int find_missing_rules(const char *rules_path, const char *appmap_path,
+int find_missing_rules(const struct ruleset *rules, const char *appmap_path,
                        const char *dotfiles_path, struct missing_rules *out) {
+    if (!out) return -1;
     memset(out, 0, sizeof(*out));
-
-    struct ruleset rules;
-    if (ruleset_load(rules_path, &rules) != 0) {
-        return -1;
-    }
+    if (!rules) return -1;
 
     struct appmap appmap;
     if (appmap_load(appmap_path, &appmap) != 0) {
-        ruleset_free(&rules);
         return -1;
     }
 
@@ -121,7 +192,7 @@ int find_missing_rules(const char *rules_path, const char *appmap_path,
 
         int covered = 0;
         for (size_t j = 0; j < e->class_count && !covered; j++) {
-            if (rules_cover_class(&rules, e->classes[j])) {
+            if (rules_cover_class(rules, e->classes[j])) {
                 covered = 1;
             }
         }
@@ -154,6 +225,5 @@ int find_missing_rules(const char *rules_path, const char *appmap_path,
 
     free(dotfiles_exp);
     appmap_free(&appmap);
-    ruleset_free(&rules);
     return 0;
 }

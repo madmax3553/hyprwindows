@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "util.h"
+
 /*
  * Simple JSON string extraction for hyprctl -j clients output.
  * We know the exact structure: an array of objects with known keys.
@@ -65,10 +67,12 @@ static char *json_get_str(const char *buf, size_t len, size_t start, const char 
         if (p >= end) return NULL;
 
         size_t vlen = (size_t)(p - val_start);
-        char *result = malloc(vlen + 1);
-        if (!result) return NULL;
-        memcpy(result, val_start, vlen);
-        result[vlen] = '\0';
+        char *raw = malloc(vlen + 1);
+        if (!raw) return NULL;
+        memcpy(raw, val_start, vlen);
+        raw[vlen] = '\0';
+        char *result = json_unescape(raw);
+        free(raw);
         return result;
     }
     return NULL;

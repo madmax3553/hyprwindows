@@ -6,5 +6,4 @@
 #include "src/appmap.c"
 #include "src/history.c"
 #include "src/actions.c"
-#include "src/ui.c"
 #include "src/main.c"

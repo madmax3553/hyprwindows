@@ -11,6 +11,7 @@ enum change_type { CHANGE_EDIT, CHANGE_DELETE };
 struct change_record {
     enum change_type type;
     int rule_index;
+    int file_order;
     struct rule old_state;
     struct rule new_state;
     char description[128];
@@ -26,10 +27,13 @@ struct history_stack {
 
 void history_init(struct history_stack *h);
 void history_record(struct history_stack *h, enum change_type type, int rule_index,
+                    int file_order,
                     const struct rule *old_state, const struct rule *new_state,
                     const char *description);
-struct rule *history_undo(struct history_stack *h, int *out_index, enum change_type *out_type);
-struct rule *history_redo(struct history_stack *h, int *out_index, enum change_type *out_type);
+struct rule *history_undo(struct history_stack *h, int *out_index, enum change_type *out_type,
+                          int *out_file_order);
+struct rule *history_redo(struct history_stack *h, int *out_index, enum change_type *out_type,
+                          int *out_file_order);
 int history_can_undo(const struct history_stack *h);
 int history_can_redo(const struct history_stack *h);
 void history_free(struct history_stack *h);

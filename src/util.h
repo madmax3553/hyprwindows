@@ -13,4 +13,7 @@ void str_to_lower_inplace(char *s);
 char *read_file(const char *path, size_t *out_len);
 char *expand_home(const char *path);
 
+/* copy a JSON string value, resolving simple escapes (\" \\ \/ \n \t \r) */
+char *json_unescape(const char *src);
+
 #endif
